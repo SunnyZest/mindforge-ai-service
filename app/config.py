@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     claim_limit: int = 10
     # 是否在应用启动时就开启轮询（调试时可先关掉）
     enable_poller: bool = True
+    # 每隔多少轮清理一次「已删除文档的向量」。
+    # 认领是每 poll_interval_seconds 一轮，清理不需要那么勤 ——
+    # 12 轮约 1 分钟，延迟完全可以接受。
+    vector_purge_every_n_rounds: int = 12
 
     # ---------- 分块 ----------
     # 文档里建议 800/150；原 agent 项目用的是 200/20（偏碎，检索时上下文不够）

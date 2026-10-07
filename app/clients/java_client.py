@@ -122,6 +122,32 @@ class JavaClient:
         self._raise_for_status(resp, "写分块")
         return resp.json().get("data") or 0
 
+    # ---------- ④ 清理已删除文档的向量 ----------
+
+    async def list_pending_vector_purge(self, limit: int = 100) -> list[dict]:
+        """查出「已删除但向量未清」的文档。
+
+        删除文档只做逻辑删除，向量库里的向量不会自动消失 ——
+        会留下「孤儿向量」，检索时可能召回已删文档的内容。
+        这个方法就是拿待清理清单。
+
+        返回空列表 = 没有待清理的（正常情况）。
+        """
+        resp = await self._client.get(
+            self._url("/internal/documents/pending-vector-purge"),
+            params={"limit": limit},
+        )
+        self._raise_for_status(resp, "查询待清理向量")
+        body = resp.json()
+        return body.get("data") or []
+
+    async def mark_vector_purged(self, document_id: int | str) -> None:
+        """标记某个文档的向量已清除。幂等，重复调用不会出错。"""
+        resp = await self._client.put(
+            self._url(f"/internal/documents/{document_id}/vector-purged"),
+        )
+        self._raise_for_status(resp, "标记向量已清除")
+
     # ---------- 生命周期 ----------
 
     async def aclose(self) -> None:

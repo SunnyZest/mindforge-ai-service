@@ -160,6 +160,36 @@ POST /internal/documents/{id}/chunks
 - 返回的 `data` 是写入条数
 - `chunks` 不能是空数组，`content` 不能为空
 
+### ④ 查询待清理向量的文档
+
+```http
+GET /internal/documents/pending-vector-purge?limit=100
+```
+
+```json
+{
+  "code": 0,
+  "data": [
+    { "documentId": "26", "knowledgeBaseId": "17", "userId": "2", "fileName": "a.txt" }
+  ]
+}
+```
+
+**为什么需要**：删除文档只做逻辑删除（`deleted = 1`），向量库里的向量不会自动消失 ——
+会留下「孤儿向量」，检索时可能召回已被删除的文档内容。
+本服务定期拉这个列表，删掉向量后再回写「已清理」。
+
+**为什么是「本服务来拉」而不是「Java 通知本服务」**：本服务将来可能跑在 NAT 后的虚拟机里，
+Java 主动调它需要端口转发，而这个方向天然可达。
+
+### ⑤ 标记向量已清除
+
+```http
+PUT /internal/documents/{id}/vector-purged
+```
+
+**幂等** —— 重复调用不会出错（第二次影响 0 行，按成功处理）。
+
 ### 状态流转
 
 ```

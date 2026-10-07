@@ -15,8 +15,12 @@ import logging
 from app.clients.java_client import java_client
 from app.config import settings
 from app.services.pipeline import process_document
+from app.services.vector_store import vector_store
 
 logger = logging.getLogger(__name__)
+
+# 清理频率从配置读（默认 12 轮 ≈ 1 分钟），见 config.py
+_PURGE_EVERY_N_ROUNDS = max(1, settings.vector_purge_every_n_rounds)
 
 # 连续失败时的退避上限：Java 挂了不要每 5 秒狂试，把日志刷爆。
 #
@@ -35,31 +39,37 @@ async def poll_loop() -> None:
     """
     interval = max(1, settings.poll_interval_seconds)
     consecutive_failures = 0
+    rounds = 0
 
-    logger.info("轮询循环已启动（间隔 %d 秒，单次最多认领 %d 篇）",
-                interval, settings.claim_limit)
+    logger.info("轮询循环已启动（间隔 %d 秒，单次最多认领 %d 篇，每 %d 轮清理一次向量）",
+                interval, settings.claim_limit, _PURGE_EVERY_N_ROUNDS)
 
     while True:
         try:
             tasks = await java_client.claim()
 
-            if not tasks:
+            if tasks:
+                # 有任务：退避计数清零
+                consecutive_failures = 0
+                logger.info("认领到 %d 篇文档：%s",
+                            len(tasks), [t.get("fileName") for t in tasks])
+
+                # 串行处理，一次一篇 —— 简单可控，也不会打爆嵌入接口的限流。
+                # 单篇文档的处理时间通常远小于轮询间隔，串行不会成为瓶颈。
+                for task in tasks:
+                    await process_document(task)
+            else:
                 # 没任务：正常情况，睡一会儿再来
                 consecutive_failures = 0
                 await asyncio.sleep(interval)
-                continue
 
-            # 有任务：退避计数清零
-            consecutive_failures = 0
-            logger.info("认领到 %d 篇文档：%s",
-                        len(tasks), [t.get("fileName") for t in tasks])
-
-            # 串行处理，一次一篇 —— 简单可控，也不会打爆嵌入接口的限流。
-            # 单篇文档的处理时间通常远小于轮询间隔，串行不会成为瓶颈。
-            for task in tasks:
-                await process_document(task)
-
-            # 处理完不 sleep，立刻回上去领下一批 —— 可能还有
+            # 每隔 N 轮清一次已删除文档的向量。
+            # 放在这里而不是单独开一个任务：复用同一套退避逻辑，
+            # 而且清理失败不会影响认领（_purge_deleted_vectors 内部兜住了异常）。
+            rounds += 1
+            if rounds >= _PURGE_EVERY_N_ROUNDS:
+                rounds = 0
+                await _purge_deleted_vectors()
 
         except asyncio.CancelledError:
             logger.info("轮询循环收到取消信号，正在退出…")
@@ -74,3 +84,40 @@ async def poll_loop() -> None:
             logger.exception("轮询出错（连续第 %d 次），%d 秒后重试",
                              consecutive_failures, backoff)
             await asyncio.sleep(backoff)
+
+
+async def _purge_deleted_vectors() -> None:
+    """清理「已删除文档」在向量库里留下的向量。
+
+    为什么需要：删除文档只做逻辑删除，向量库不会自动同步 ——
+    不清的话会留下「孤儿向量」，检索时可能召回已删文档的内容。
+
+    为什么由本服务主动拉、而不是 Java 主动通知：
+    Java 在 Windows、本服务将来可能在 NAT 后的虚拟机里，
+    「Java → 本服务」方向需要端口转发，而「本服务 → Java」天然可达。
+
+    这个方法【不抛异常】—— 清理失败不该影响文档认领。
+    """
+    try:
+        docs = await java_client.list_pending_vector_purge()
+    except Exception:                                # noqa: BLE001
+        logger.exception("拉取待清理向量列表失败（不影响文档处理）")
+        return
+
+    if not docs:
+        return
+
+    logger.info("开始清理 %d 篇已删除文档的向量", len(docs))
+    purged = 0
+
+    for doc in docs:
+        document_id = doc.get("documentId")
+        try:
+            await vector_store.delete_by_document(document_id)
+            await java_client.mark_vector_purged(document_id)
+            purged += 1
+        except Exception:                            # noqa: BLE001
+            # 单个失败不影响其他文档；下次轮询还会拿到它重试
+            logger.exception("清理文档 %s 的向量失败（下次会重试）", document_id)
+
+    logger.info("向量清理完成：%d/%d 篇", purged, len(docs))
