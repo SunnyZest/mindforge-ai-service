@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     max_chunks_per_document: int = 2000
     # 检索时返回的片段数
     retrieval_top_k: int = 8
+    # 调用方传 topK 时的上限兜底 ——
+    # 传太大会把一堆无关片段塞进 prompt，既费钱又降低答案质量
+    max_retrieval_top_k: int = 50
 
     # ---------- 本服务 ----------
     service_port: int = 8000

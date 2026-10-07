@@ -216,7 +216,59 @@ PENDING ──认领──→ PARSING ──解析成功──→ SUCCESS（pars
 | 409 | 40902 | 状态冲突 |
 | 500 | 50000 | 服务端错误 |
 
-## 本服务的接口文档
+## 本服务对外提供的接口
+
+本服务【只给 Java 调用】，路径前缀 `/internal/ai/v1`，同样用 `X-Service-Token` 校验。
+
+> **注意方向和上面相反**：文档处理是「本服务去拉 Java」，而这里的检索是「Java 调本服务」。
+> 因为检索要同步返回结果，用户在等着；而文档处理是长耗时任务，适合异步。
+
+### POST /internal/ai/v1/rag/search
+
+在指定知识库内做语义检索。
+
+```json
+{
+  "userId": "10001",
+  "knowledgeBaseId": "30001",
+  "query": "什么是 Spring Boot 自动配置？",
+  "topK": 8,
+  "enableRerank": false
+}
+```
+
+响应：
+
+```json
+{
+  "code": 0,
+  "message": "成功",
+  "data": {
+    "results": [
+      {
+        "chunkId": "doc18-chunk0",
+        "documentId": "18",
+        "knowledgeBaseId": "30001",
+        "chunkIndex": 0,
+        "content": "分块正文……",
+        "score": 0.8614
+      }
+    ],
+    "total": 1,
+    "reranked": false
+  }
+}
+```
+
+**要点**：
+
+- `knowledgeBaseId` **必传** —— 它是数据隔离的安全边界，传空会返回 400
+- `userId` 只用于日志 —— 权限由 Java 在调用前查好（文档 §十七）
+- `score` 是 0~1 的相似度（已把 Chroma 的 cosine 距离换算过来）
+- `enableRerank` **暂不生效**（没接重排序模型），响应里 `reranked` 如实返回 `false`
+- 参数不合法统一返回 **HTTP 400 + `{code: 40001}`**，和 Java 的 `Result` 格式一致
+
+## 本服务的接口文档（Swagger）
 
 启动后访问：
 
@@ -232,7 +284,8 @@ app/
 ├── main.py                  FastAPI 入口 + 启动/关闭钩子
 ├── config.py                配置（pydantic-settings 读 .env）
 ├── api/
-│   └── health.py            健康检查
+│   ├── health.py            健康检查
+│   └── internal.py          /internal/ai/v1/**（供 Java 调用）
 ├── core/
 │   └── security.py          X-Service-Token 校验
 ├── clients/
@@ -242,7 +295,8 @@ app/
 │   ├── splitter.py          文本分块
 │   ├── embedding.py         文本 → 向量（DashScope）
 │   ├── vector_store.py      向量存储与检索（Chroma）
-│   └── pipeline.py          文档处理流水线
+│   ├── pipeline.py          文档处理流水线
+│   └── rag.py               RAG 检索编排
 └── worker/
     └── poller.py            轮询循环
 data/chroma/                 Chroma 向量库持久化目录

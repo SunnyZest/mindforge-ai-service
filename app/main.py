@@ -13,9 +13,11 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager, suppress
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
-from app.api import health
+from app.api import health, internal
 from app.clients.java_client import java_client
 from app.config import settings
 from app.worker.poller import poll_loop
@@ -89,3 +91,66 @@ app = FastAPI(
 )
 
 app.include_router(health.router)
+app.include_router(internal.router)
+
+
+# ---------- 统一响应格式 ----------
+#
+# FastAPI 默认的错误格式是 {"detail": "..."}，和 Java 的 Result 不一样。
+# Java 侧调用本服务时要解析响应，统一成 {code, message, data} 能省掉一套适配代码。
+
+_CODE_BY_STATUS = {
+    400: 40001,
+    401: 40101,
+    403: 40301,
+    404: 40404,
+    422: 40001,      # FastAPI 的参数校验失败
+    500: 50000,
+}
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": _CODE_BY_STATUS.get(exc.status_code, 50000),
+            "message": exc.detail,
+            "data": None,
+        },
+    )
+
+
+@app.exception_handler(ValueError)
+async def value_error_handler(_: Request, exc: ValueError) -> JSONResponse:
+    """业务参数不合法 —— 比如查询为空、knowledgeBaseId 缺失。
+
+    这类错误是调用方传错了参数，属于 4xx 而不是 5xx。
+    """
+    logger.warning("参数不合法：%s", exc)
+    return JSONResponse(
+        status_code=400,
+        content={"code": 40001, "message": str(exc), "data": None},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    """FastAPI 的请求体校验失败。
+
+    ⚠️ 这个必须单独注册：pydantic 的校验错误抛的是 RequestValidationError，
+    不是 HTTPException，上面那个 handler 兜不住 —— 不注册的话会走 FastAPI 默认，
+    返回 422 + {"detail": [...]}，格式和文档约定的 400 + {code, message, data} 对不上。
+
+    这里统一成 400，和 Java 的 Result 格式一致。
+    """
+    # 取第一条错误拼成人话，别把整个 pydantic 错误数组丢给调用方
+    first = (exc.errors() or [{}])[0]
+    field = ".".join(str(p) for p in first.get("loc", []) if p != "body")
+    detail = f"参数校验失败：{field} {first.get('msg', '')}".strip()
+
+    logger.warning("请求体校验失败：%s", detail)
+    return JSONResponse(
+        status_code=400,
+        content={"code": 40001, "message": detail, "data": None},
+    )
