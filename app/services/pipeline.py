@@ -16,7 +16,7 @@ import httpx
 from app.clients.java_client import java_client
 from app.config import settings
 from app.services.embedding import embedding_service
-from app.services.parser import UnsupportedFileTypeError, parse
+from app.services.parser import ParseError, UnsupportedFileTypeError, parse
 from app.services.splitter import estimate_tokens, split
 from app.services.vector_store import vector_store
 
@@ -128,9 +128,10 @@ async def process_document(task: dict) -> bool:
         logger.warning("  ⑤ 部分完成：写入 %d 个分块，但向量化失败", inserted)
         return False
 
-    except UnsupportedFileTypeError as exc:
-        # 类型不支持属于「预期内的失败」，日志用 warning 不用 exception
-        logger.warning("  文档 %s 处理失败（类型不支持）：%s", document_id, exc)
+    except (UnsupportedFileTypeError, ParseError) as exc:
+        # 这两类属于「预期内的失败」（类型不支持 / 扫描件 / 文件损坏），
+        # 日志用 warning 不用 exception —— 打一堆堆栈只会淹没真正的问题
+        logger.warning("  文档 %s 处理失败：%s", document_id, exc)
         await _mark_failed(document_id, str(exc))
         return False
 
