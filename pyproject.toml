@@ -1,0 +1,30 @@
+[project]
+name = "mindforge-ai-service"
+version = "0.1.0"
+description = "MindForge AI 的 Python AI 服务：文档解析、分块、向量化、RAG 检索与对话"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "chromadb>=1.5.9",
+    "fastapi>=0.142.2",
+    "httpx>=0.28.1",
+    "openai>=3.26.0",
+    "pydantic-settings>=2.15.0",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[tool.uv.workspace]
+members = [
+    "mindforge-ai-service",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+# 说明
+# · 这是「应用」不是「库」，所以刻意不写 [build-system] 和 [project.scripts]：
+#   没有 [build-system] 时 uv 会把它当 virtual project，不做 editable install —— 正是我们要的。
+# · 依赖用 `uv add xxx` 添加，会自动写进上面的 dependencies。
+# · 原来 uv init 生成的 [project.scripts] 指向 `mindforge_ai_service:main`，
+#   那个函数不存在，留着会让 uv sync 在生成入口点时出问题，所以删掉了。
