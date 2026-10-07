@@ -19,12 +19,13 @@ from fastapi.responses import JSONResponse
 
 from app.api import health, internal
 from app.clients.java_client import java_client
-from app.config import settings
+from app.config import PROJECT_ROOT, settings
 from app.worker.poller import poll_loop
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)-5s [%(name)s] %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)-5s - %(filename)s:%(lineno)d - %(message)s",
+
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
@@ -60,6 +61,15 @@ async def lifespan(_: FastAPI):
     logger.info("   轮询开关     : %s", settings.enable_poller)
     logger.info("   分块参数     : chunk_size=%d, overlap=%d",
                 settings.chunk_size, settings.chunk_overlap)
+
+    # 配置自检：把「配置漏了」在启动时就喊出来，别等到运行中才报 401
+    if not settings.java_service_token:
+        logger.error("JAVA_SERVICE_TOKEN 没配置！"
+                     "所有 /internal 请求会被 Java 拒绝（401）。"
+                     "请检查 %s 是否存在且已填。",
+                     PROJECT_ROOT / ".env")
+    if not settings.dashscope_api_key:
+        logger.error("DASHSCOPE_API_KEY 没配置！文档向量化和问答都会失败。")
 
     # 启动时探测一次 Java（只打日志，不阻塞启动 —— Java 没起也不能把本服务卡死）
     probe_task = asyncio.create_task(_probe_java())

@@ -23,15 +23,36 @@ _TIMEOUT_SECONDS = 60.0
 _EMPTY_PLACEHOLDER = "（空）"
 
 
+# 没配 key 时用它占位，让 client 能构造出来。
+#
+# ⚠️ 为什么要这样：模块级单例是在 import 时构造的，如果这里直接传空 key，
+# AsyncOpenAI 会抛 OpenAIError，导致【整个服务起不来】——
+# 连带 /health 都用不了，而错误信息还是误导性的
+# 「set the OPENAI_API_KEY environment variable」（本项目用的是 DashScope，
+# 根本没配 OPENAI_API_KEY）。所以这里降级成「能启动、调用时才报错」，
+# 并把错误信息说清楚。
+_KEY_NOT_CONFIGURED = "NOT_CONFIGURED"
+
+
 class EmbeddingService:
     """文本 → 向量。"""
 
     def __init__(self) -> None:
         self._client = AsyncOpenAI(
-            api_key=settings.dashscope_api_key,
+            api_key=settings.dashscope_api_key or _KEY_NOT_CONFIGURED,
             base_url=settings.dashscope_base_url,
             timeout=_TIMEOUT_SECONDS,
         )
+
+    @staticmethod
+    def _ensure_configured() -> None:
+        """调用前检查 key —— 报错要说清是哪个配置项，别让人去猜。"""
+        if not settings.dashscope_api_key:
+            raise RuntimeError(
+                "DASHSCOPE_API_KEY 未配置，无法调用嵌入模型。"
+                "请在项目根目录的 .env 里填写（注意：本项目用 DashScope 的 "
+                "OpenAI 兼容接口，配的是 DASHSCOPE_API_KEY，不是 OPENAI_API_KEY）"
+            )
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """批量嵌入，自动按 API 上限分批。
@@ -47,6 +68,8 @@ class EmbeddingService:
         """
         if not texts:
             return []
+
+        self._ensure_configured()
 
         # 空文本会让 DashScope 报错，先顶掉
         cleaned = [t if (t and t.strip()) else _EMPTY_PLACEHOLDER for t in texts]
