@@ -99,7 +99,7 @@ async def process_document(task: dict) -> bool:
         except Exception:                            # noqa: BLE001
             # 向量化失败【不往外抛】—— 分块结果仍然要保存，
             # 否则用户看到 chunk_status=SUCCESS 但一条分块都没有，更困惑。
-            logger.exception("  ④ 向量化失败（分块结果仍会保存，但暂时不可检索）")
+            logger.exception("  ④ 向量化失败（分块结果仍会保存，但这些分块不会被检索到）")
 
         # ---------- ⑤ 写回 Java ----------
         chunks = [

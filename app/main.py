@@ -1,9 +1,9 @@
 """MindForge AI Service —— FastAPI 入口。
 
-第 0 步只做「把管子接上」：
-  · 起一个 HTTP 服务（/health）
-  · 能调通 Java 的内部接口（启动时探测一次 + /health/java 手动探测）
-  · 还不处理任何文档
+职责：
+  · 提供 HTTP 服务（/health 等）
+  · 启动时探测 Java 连通性（只打日志，不阻塞启动）
+  · 启动轮询任务，主动去 Java 领待处理文档并跑流水线
 
 启动：
     uv run uvicorn app.main:app --reload --port 8000
@@ -44,8 +44,8 @@ async def _probe_java() -> None:
         logger.info("✅ 已连上 Java（%s），当前待处理文档 %d 篇",
                     settings.java_base_url, len(docs))
         if docs:
-            logger.info("   认领到：%s", [d.get("fileName") for d in docs])
-            logger.info("   （第 0 步还没实现处理逻辑，这些文档会被 Java 的超时任务回收）")
+            logger.info("   认领到：%s（会由轮询任务继续处理）",
+                        [d.get("fileName") for d in docs])
     except Exception as exc:                       # noqa: BLE001
         logger.error("❌ 连不上 Java：%s", exc)
         logger.error("   请检查：① Java 是否已启动  ② JAVA_SERVICE_TOKEN 是否与 Java 一致")

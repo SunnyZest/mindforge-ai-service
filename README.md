@@ -47,7 +47,7 @@ Copy-Item .env.example .env
 uv run uvicorn app.main:app --reload --port 8000
 ```
 
-## 验证（第 0 步）
+## 验证连通性
 
 启动后看日志：
 
@@ -72,8 +72,7 @@ uv run uvicorn app.main:app --reload --port 8000
 
 ## 与 Java 的接口契约
 
-本服务只依赖 Java 的 **3 个内部接口**。它们**不在 API 文档里** ——
-文档 §十七 只定义了 Java → Python 的方向，没写 Python 怎么回写，这是设计时漏掉的一环。
+本服务通过 Java 的 **3 个内部接口**与后端交互。
 
 **所有请求都必须带 `X-Service-Token` 请求头**，值等于 Java 的
 `mindforge.internal.service-token`（两边配成完全一致）。
@@ -200,28 +199,24 @@ http://localhost:8000/redoc       ReDoc
 
 ```
 app/
-├── main.py              FastAPI 入口 + 启动/关闭钩子
-├── config.py            配置（pydantic-settings 读 .env）
+├── main.py                  FastAPI 入口 + 启动/关闭钩子
+├── config.py                配置（pydantic-settings 读 .env）
 ├── api/
-│   └── health.py        健康检查
+│   └── health.py            健康检查
 ├── core/
-│   └── security.py      X-Service-Token 校验（校验 Java 发来的请求）
+│   └── security.py          X-Service-Token 校验
 ├── clients/
-│   └── java_client.py   调 Java 的 claim / status / chunks
-├── services/            ← 待实现：parser / splitter / vector_store / pipeline
-└── worker/              ← 待实现：轮询循环
-data/chroma/             Chroma 向量库持久化目录
+│   └── java_client.py       调 Java 的 claim / status / chunks
+├── services/
+│   ├── parser.py            文件 → 纯文本
+│   ├── splitter.py          文本分块
+│   ├── embedding.py         文本 → 向量（DashScope）
+│   ├── vector_store.py      向量存储与检索（Chroma）
+│   └── pipeline.py          文档处理流水线
+└── worker/
+    └── poller.py            轮询循环
+data/chroma/                 Chroma 向量库持久化目录
 ```
-
-## 实施进度
-
-- [x] **第 0 步** 骨架 + 通信验证
-- [x] **第 1 步** 最小闭环（TXT：轮询 → 下载 → 解析 → 分块 → 回写状态）
-- [x] **第 2 步** 向量化（DashScope 嵌入 + Chroma + 多知识库 metadata 隔离）
-- [ ] 第 3 步 RAG 检索
-- [ ] 第 4 步 RAG 对话
-- [ ] 第 5 步 加 PDF / DOCX / HTML 解析
-- [ ] 第 6 步 简历 / 面试
 
 ## 依赖管理
 

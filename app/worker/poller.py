@@ -54,8 +54,8 @@ async def poll_loop() -> None:
             logger.info("认领到 %d 篇文档：%s",
                         len(tasks), [t.get("fileName") for t in tasks])
 
-            # 串行处理 —— 第 1 步先求简单可控。
-            # 文档多了以后再改成有上限的并发（注意别打爆 DashScope 的限流）。
+            # 串行处理，一次一篇 —— 简单可控，也不会打爆嵌入接口的限流。
+            # 单篇文档的处理时间通常远小于轮询间隔，串行不会成为瓶颈。
             for task in tasks:
                 await process_document(task)
 

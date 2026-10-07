@@ -5,7 +5,7 @@
   Java → Python   走本模块的 verify_service_token（校验 Java 带来的 X-Service-Token）
   Python → Java   走 app/clients/java_client.py（主动带上 X-Service-Token）
 
-第 0 步只用到第二个方向；第一个方向是给后面 /internal/ai/v1/** 准备的。
+本服务对外提供 /internal/ai/v1/** 时用第一个方向校验调用方。
 """
 
 import logging

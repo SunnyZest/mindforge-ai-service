@@ -1,8 +1,8 @@
 """文档解析：把文件字节变成纯文本。
 
-第 1 步只支持纯文本类（TXT / MD）—— 目的是先把【整条链路】跑通。
-PDF / DOCX / HTML 留到第 5 步：PDF 解析最容易卡住（扫描件要 OCR、双栏会乱、
-表格会丢），先不碰它，免得链路还没通就陷在格式兼容里。
+目前支持纯文本类（TXT / MD）。
+PDF / DOCX / HTML 尚未支持 —— PDF 解析的坑最多（扫描件要 OCR、双栏排版会乱、
+表格会丢），需要单独处理，所以先不纳入。
 """
 
 import logging
@@ -11,7 +11,7 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 # 支持的扩展名（小写）。Java 侧允许 PDF/DOCX/TXT/MD/HTML，
-# 但本服务暂时只处理这两个，其余会明确报错 —— 报错好过静默产出垃圾数据。
+# 但本服务只处理纯文本类，其余会明确报错 —— 报错好过静默产出垃圾数据。
 SUPPORTED_TEXT_TYPES = {"TXT", "MD", "MARKDOWN"}
 
 
@@ -39,8 +39,8 @@ def parse(content: bytes, file_type: str) -> ParseResult:
 
     if normalized not in SUPPORTED_TEXT_TYPES:
         raise UnsupportedFileTypeError(
-            f"暂不支持 {normalized} 格式，当前只支持 "
-            f"{' / '.join(sorted(SUPPORTED_TEXT_TYPES))}（PDF/DOCX/HTML 计划在第 5 步支持）"
+            f"暂不支持 {normalized} 格式，当前支持的格式："
+            f"{' / '.join(sorted(SUPPORTED_TEXT_TYPES))}"
         )
 
     # 纯文本：先按 UTF-8 解，失败再试 GBK —— 国内用户用 Windows 记事本存的文件
