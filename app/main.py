@@ -11,13 +11,14 @@
 
 import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 
 from app.api import health
 from app.clients.java_client import java_client
 from app.config import settings
+from app.worker.poller import poll_loop
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,16 +55,29 @@ async def _probe_java() -> None:
 async def lifespan(_: FastAPI):
     logger.info("MindForge AI Service 启动中…")
     logger.info("   Java 后端    : %s", settings.java_base_url)
+    logger.info("   轮询开关     : %s", settings.enable_poller)
     logger.info("   分块参数     : chunk_size=%d, overlap=%d",
                 settings.chunk_size, settings.chunk_overlap)
 
     # 启动时探测一次 Java（只打日志，不阻塞启动 —— Java 没起也不能把本服务卡死）
     probe_task = asyncio.create_task(_probe_java())
 
+    # 轮询循环：本服务主动去 Java 领任务
+    poller_task: asyncio.Task | None = None
+    if settings.enable_poller:
+        poller_task = asyncio.create_task(poll_loop())
+    else:
+        logger.warning("   轮询已关闭（ENABLE_POLLER=false）—— 不会处理任何文档")
+
     yield
 
     logger.info("MindForge AI Service 关闭中…")
     probe_task.cancel()
+    if poller_task is not None:
+        poller_task.cancel()
+        # 等它真正退出，再关 httpx 连接池 —— 否则可能在半路被抽掉 client
+        with suppress(asyncio.CancelledError):
+            await poller_task
     await java_client.aclose()
 
 
