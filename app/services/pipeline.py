@@ -15,8 +15,10 @@ import httpx
 
 from app.clients.java_client import java_client
 from app.config import settings
+from app.services.embedding import embedding_service
 from app.services.parser import UnsupportedFileTypeError, parse
 from app.services.splitter import estimate_tokens, split
+from app.services.vector_store import vector_store
 
 logger = logging.getLogger(__name__)
 
@@ -66,17 +68,47 @@ async def process_document(task: dict) -> bool:
         if not pieces:
             raise ValueError("分块后没有任何内容")
 
+        # 防御性上限：超大文件可能切出几万块，把 embedding API 打爆（也烧钱）
+        if len(pieces) > settings.max_chunks_per_document:
+            raise ValueError(
+                f"分块数 {len(pieces)} 超过上限 {settings.max_chunks_per_document}，"
+                f"请拆分后再上传"
+            )
+
         logger.info("  ③ 分块完成：%d 个片段（size=%d, overlap=%d）",
                     len(pieces), settings.chunk_size, settings.chunk_overlap)
 
-        # ---------- ④ 写回 Java ----------
+        # 分块确实成功了，先如实上报 —— 后面向量化失败不该让这个状态变成 FAILED
+        await java_client.update_status(document_id, chunk_status="SUCCESS")
+
+        # ---------- ④ 向量化 ----------
+        # ⚠️ 这里是数据隔离的关键点：把 knowledge_base_id 写进向量 metadata，
+        #    检索时靠它过滤。Java 的 claim 响应里带了这个字段，必须原样传下去。
+        vector_ids: list[str] | None = None
+        try:
+            embeddings = await embedding_service.embed(pieces)
+            vector_ids = await vector_store.add(
+                document_id=document_id,
+                knowledge_base_id=task["knowledgeBaseId"],
+                user_id=task["userId"],
+                chunks=pieces,
+                embeddings=embeddings,
+            )
+            logger.info("  ④ 向量化完成：%d 条（kb=%s）",
+                        len(vector_ids), task["knowledgeBaseId"])
+        except Exception:                            # noqa: BLE001
+            # 向量化失败【不往外抛】—— 分块结果仍然要保存，
+            # 否则用户看到 chunk_status=SUCCESS 但一条分块都没有，更困惑。
+            logger.exception("  ④ 向量化失败（分块结果仍会保存，但暂时不可检索）")
+
+        # ---------- ⑤ 写回 Java ----------
         chunks = [
             {
                 "chunkIndex": i,
                 "content": piece,
                 "tokenCount": estimate_tokens(piece),
                 "pageNo": 1,
-                "vectorId": None,          # 第 1 步不做向量化
+                "vectorId": vector_ids[i] if vector_ids else None,
                 "metadataJson": None,
             }
             for i, piece in enumerate(pieces)
@@ -85,14 +117,16 @@ async def process_document(task: dict) -> bool:
 
         await java_client.update_status(
             document_id,
-            chunk_status="SUCCESS",
-            # vector_status 保持 PENDING —— 第 2 步才做向量化。
-            # 这里刻意不设成 SUCCESS：假的状态会让后面的检索把没向量的文档也捞出来。
+            vector_status="SUCCESS" if vector_ids else "FAILED",
+            error_message=None if vector_ids else "向量化失败，详见 AI 服务日志",
         )
 
-        logger.info("  ④ 完成：写入 %d 个分块（vector_status 仍为 PENDING，等第 2 步）",
-                    inserted)
-        return True
+        if vector_ids:
+            logger.info("  ⑤ 完成：写入 %d 个分块 + %d 条向量", inserted, len(vector_ids))
+            return True
+
+        logger.warning("  ⑤ 部分完成：写入 %d 个分块，但向量化失败", inserted)
+        return False
 
     except UnsupportedFileTypeError as exc:
         # 类型不支持属于「预期内的失败」，日志用 warning 不用 exception

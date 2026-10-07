@@ -39,6 +39,20 @@ class Settings(BaseSettings):
     chunk_size: int = 800
     chunk_overlap: int = 150
 
+    # ---------- 向量库 ----------
+    # Chroma 的持久化目录（相对项目根，代码里会转成绝对路径，不依赖 CWD）
+    chroma_path: str = "data/chroma"
+    chroma_collection: str = "mindforge_chunks"
+
+    # ---------- 嵌入 ----------
+    # DashScope 的 embedding 接口单次最多 25 条，超了会报错，所以要分批
+    embedding_batch_size: int = 25
+    # 单文档最多切多少块 —— 防御性上限。
+    # 超大文件可能切出几万块，把 embedding API 打爆（也烧钱）。
+    max_chunks_per_document: int = 2000
+    # 检索时返回的片段数
+    retrieval_top_k: int = 8
+
     # ---------- 本服务 ----------
     service_port: int = 8000
 

@@ -217,7 +217,7 @@ data/chroma/             Chroma 向量库持久化目录
 
 - [x] **第 0 步** 骨架 + 通信验证
 - [x] **第 1 步** 最小闭环（TXT：轮询 → 下载 → 解析 → 分块 → 回写状态）
-- [ ] 第 2 步 向量化（Chroma + 多知识库 metadata 隔离）
+- [x] **第 2 步** 向量化（DashScope 嵌入 + Chroma + 多知识库 metadata 隔离）
 - [ ] 第 3 步 RAG 检索
 - [ ] 第 4 步 RAG 对话
 - [ ] 第 5 步 加 PDF / DOCX / HTML 解析
