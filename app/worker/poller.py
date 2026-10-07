@@ -18,8 +18,13 @@ from app.services.pipeline import process_document
 
 logger = logging.getLogger(__name__)
 
-# 连续失败时的退避上限：Java 挂了不要每 5 秒狂试，把日志刷爆
-_MAX_BACKOFF_SECONDS = 60
+# 连续失败时的退避上限：Java 挂了不要每 5 秒狂试，把日志刷爆。
+#
+# 上限刻意压到 30 秒 —— 实测踩过：Java 启动要 10 秒以上，Python 先起来会连不上，
+# 如果退避用指数增长（5→10→20→40→60），Java 起来后还要再等 60 秒才恢复，
+# 看起来像「Python 坏了」。线性退避最多等 30 秒，体感好很多，
+# 又不会在 Java 真挂时把日志刷爆。
+_MAX_BACKOFF_SECONDS = 30
 
 
 async def poll_loop() -> None:
@@ -64,7 +69,8 @@ async def poll_loop() -> None:
             # 这里兜的是「连不上 Java」之类的循环级错误，
             # 单个文档的处理失败已经在 process_document 内部消化了。
             consecutive_failures += 1
-            backoff = min(interval * (2 ** min(consecutive_failures, 4)), _MAX_BACKOFF_SECONDS)
-            logger.exception("轮询出错（连续第 %d 次），%.0f 秒后重试",
+            # 线性退避（不是指数）—— 见 _MAX_BACKOFF_SECONDS 的注释
+            backoff = min(interval * consecutive_failures, _MAX_BACKOFF_SECONDS)
+            logger.exception("轮询出错（连续第 %d 次），%d 秒后重试",
                              consecutive_failures, backoff)
             await asyncio.sleep(backoff)
