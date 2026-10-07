@@ -1,14 +1,30 @@
 """全局配置。
 
 所有配置项都从环境变量 / .env 文件读，不写死在代码里 —— 换环境只改 .env。
+
+优先级（从高到低）：
+  1. 环境变量        —— 临时覆盖用，比如 `CHUNK_SIZE=999 uv run ...`
+  2. .env 文件
+  3. 下面代码里的默认值
+
+⚠️ 大小写不敏感：字段 `java_base_url` 对应 `JAVA_BASE_URL`，两种写法都能识别。
 """
 
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# app/config.py → parents[1] 就是项目根目录
+#
+# ⚠️ 必须用绝对路径，不能写 env_file=".env" ——
+# 相对路径是相对【当前工作目录】的，从别的目录启动就读不到 .env，
+# 配置会静默退回代码里的默认值（token 变成空字符串，所有内部请求 401）。。
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",
         extra="ignore",          # .env 里有别的键也不报错
     )
@@ -59,6 +75,21 @@ class Settings(BaseSettings):
     # 调用方传 topK 时的上限兜底 ——
     # 传太大会把一堆无关片段塞进 prompt，既费钱又降低答案质量
     max_retrieval_top_k: int = 50
+
+    # ---------- 对话 ----------
+    # 温度：问答场景要调低，越低越不容易编造。
+    # 用模型默认的 1.0 会让它在资料里没有答案时「自由发挥」。
+    chat_temperature: float = 0.3
+    # 单次回答的长度上限
+    chat_max_tokens: int = 2000
+    # 拼进 prompt 的参考资料总长度上限（字符）。
+    # 超了会被截断 —— 与其让模型收到超长 prompt 报错，不如主动截断并说明。
+    max_context_chars: int = 12000
+    # 多轮对话最多带几轮历史（太多会挤占参考资料的空间）
+    max_history_rounds: int = 5
+    # 相似度低于这个值的片段不放进参考资料 ——
+    # 宁可不答，也别拿不相关的内容硬凑
+    min_relevance_score: float = 0.35
 
     # ---------- 本服务 ----------
     service_port: int = 8000

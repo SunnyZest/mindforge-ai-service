@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from app.core.security import verify_service_token
-from app.services import rag
+from app.services import chat, rag
 
 logger = logging.getLogger(__name__)
 
@@ -70,3 +70,52 @@ async def rag_search(req: RagSearchRequest) -> dict:
             "reranked": False,
         },
     }
+
+
+class ChatHistoryItem(BaseModel):
+    """一轮历史消息。"""
+
+    role: str = Field(description="user 或 assistant")
+    content: str
+
+
+class RagChatRequest(BaseModel):
+    """对话请求。字段名同样是 camelCase，对齐文档 §十七。"""
+
+    userId: str = Field(description="调用方已确认的用户 id（本服务只用于日志，不校验权限）")
+    knowledgeBaseId: str = Field(description="知识库 id —— 数据隔离的安全边界")
+    conversationId: str | None = Field(default=None, description="会话 id（仅用于日志）")
+    query: str = Field(min_length=1, description="用户问题")
+    topK: int = Field(default=8, ge=1, le=50, description="检索片段数")
+    enableRerank: bool = Field(default=False, description="是否重排序")
+    history: list[ChatHistoryItem] = Field(
+        default_factory=list,
+        description="历史消息（可选）。Java 侧从 chat_message 表取最近几轮传过来；"
+                    "不传就是单轮问答。",
+    )
+
+
+@router.post("/rag/chat", summary="基于知识库的问答")
+async def rag_chat(req: RagChatRequest) -> dict:
+    """检索知识库并生成回答。
+
+    和 /rag/search 的区别：search 只返回片段，chat 会基于片段生成一段回答。
+
+    ⚠️ hasContext 和 hasAnswer 是两回事，前端别混用：
+    - hasContext  —— 有没有检索到片段。展示「参考了 N 个片段」用它
+    - hasAnswer   —— 模型有没有给出实质回答。判断「要不要显示答案」用它
+    两者都是 True 是常态；hasContext=True + hasAnswer=False 也常见 ——
+    检索到了片段，但片段里没有用户问的那个信息，模型如实说「资料里没有」。
+    """
+    result = await chat.chat(
+        knowledge_base_id=req.knowledgeBaseId,
+        query=req.query,
+        top_k=req.topK,
+        history=[h.model_dump() for h in req.history],
+    )
+
+    logger.info("对话请求：user=%s kb=%s conv=%s → hasAnswer=%s，%d 个引用",
+                req.userId, req.knowledgeBaseId, req.conversationId,
+                result["hasAnswer"], len(result["sources"]))
+
+    return {"code": 0, "message": "成功", "data": result}

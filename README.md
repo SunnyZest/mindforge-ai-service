@@ -268,6 +268,58 @@ PENDING ──认领──→ PARSING ──解析成功──→ SUCCESS（pars
 - `enableRerank` **暂不生效**（没接重排序模型），响应里 `reranked` 如实返回 `false`
 - 参数不合法统一返回 **HTTP 400 + `{code: 40001}`**，和 Java 的 `Result` 格式一致
 
+### POST /internal/ai/v1/rag/chat
+
+基于知识库回答问题。和 `/rag/search` 的区别：search 只返回片段，chat 会生成一段回答。
+
+```json
+{
+  "userId": "10001",
+  "knowledgeBaseId": "30001",
+  "conversationId": "90001",
+  "query": "解释 Spring Bean 生命周期",
+  "topK": 8,
+  "enableRerank": false,
+  "history": [
+    { "role": "user", "content": "上一个问题" },
+    { "role": "assistant", "content": "上一个回答" }
+  ]
+}
+```
+
+响应：
+
+```json
+{
+  "code": 0,
+  "message": "成功",
+  "data": {
+    "answer": "Spring Boot 的自动配置主要通过……",
+    "sources": [ { "chunkId": "...", "documentId": "32", "chunkIndex": 0, "score": 0.941, "content": "……" } ],
+    "hasContext": true,
+    "hasAnswer": true,
+    "contextTruncated": false
+  }
+}
+```
+
+**⚠️ `hasContext` 和 `hasAnswer` 是两回事，别混用**：
+
+| 字段 | 含义 | 用途 |
+|---|---|---|
+| `hasContext` | 有没有检索到相关片段 | 展示「参考了 N 个片段」|
+| `hasAnswer` | 模型有没有给出实质回答 | 判断「要不要显示答案」|
+
+两者都为 `true` 是常态。但 **`hasContext=true` + `hasAnswer=false` 也很常见** ——
+检索到了片段（相似度够高），但片段里没有用户问的那个信息，模型如实回答「资料里没有」。
+这时 `sources` 里有内容，但那些内容答不了这个问题。
+
+**其他要点**：
+
+- 模型被严格约束**只根据检索到的内容回答**，资料里没有的直接说「没有找到」，不编造
+- **检索不到内容时不会调用模型** —— 既省钱，也避免它硬答
+- `history` 可选，最多取最近 5 轮（太多会挤占参考资料的空间）
+
 ## 本服务的接口文档（Swagger）
 
 启动后访问：
@@ -296,7 +348,9 @@ app/
 │   ├── embedding.py         文本 → 向量（DashScope）
 │   ├── vector_store.py      向量存储与检索（Chroma）
 │   ├── pipeline.py          文档处理流水线
-│   └── rag.py               RAG 检索编排
+│   ├── rag.py               RAG 检索
+│   ├── llm.py               对话模型（DashScope）
+│   └── chat.py              RAG 对话
 └── worker/
     └── poller.py            轮询循环
 data/chroma/                 Chroma 向量库持久化目录
