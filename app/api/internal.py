@@ -17,7 +17,9 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from app.core.security import verify_service_token
-from app.services import chat, rag
+from app.services import chat, job, rag, resume
+from app.services.downloader import download_bytes
+from app.services.parser import parse
 
 logger = logging.getLogger(__name__)
 
@@ -119,3 +121,98 @@ async def rag_chat(req: RagChatRequest) -> dict:
                 result["hasAnswer"], len(result["sources"]))
 
     return {"code": 0, "message": "成功", "data": result}
+
+
+# ---------- 简历 ----------
+
+
+class ResumeParseRequest(BaseModel):
+    """简历解析请求。
+
+    Java 侧已经把权限校验做完了（简历得是他的），这里只负责算。
+    """
+
+    userId: str = Field(description="调用方已确认的用户 id（本服务只用于日志，不校验权限）")
+    resumeId: str = Field(description="简历 id（仅用于日志）")
+    fileUrl: str = Field(min_length=1, description="简历文件的预签名下载地址（Java 签发）")
+    fileType: str = Field(min_length=1, description="文件类型：PDF / DOCX / TXT / MD / HTML")
+    targetPosition: str | None = Field(
+        default=None, description="用户填的目标职位，可空 —— 有的话能帮模型填对 targetPosition")
+
+
+@router.post("/resumes/parse", summary="解析简历为结构化数据")
+async def resume_parse(req: ResumeParseRequest) -> dict:
+    """下载简历文件 → 提取文本 → 让模型结构化成 JSON。
+
+    ⚠️ 为什么返回 rawText：
+    文本提取（PDF/DOCX 解析）只有本服务会做，Java 侧没有解析器。
+    但 raw_content 要存进数据库（供后续匹配、优化复用，避免每次重新下载解析），
+    所以提取出来的原文必须回传给 Java。
+
+    ⚠️ 这是个【同步】接口，一次调用可能要几十秒（下载 + 提取 + 模型生成）。
+    Java 侧的读超时是 120 秒，够用。
+    """
+    content = await download_bytes(req.fileUrl)
+    extracted = parse(content, req.fileType)
+
+    parsed = await resume.parse_resume(
+        extracted.text,
+        target_position=req.targetPosition,
+    )
+
+    logger.info("简历解析：user=%s resume=%s → %d 字符、%d 项技能",
+                req.userId, req.resumeId, len(extracted.text), len(parsed["skills"]))
+
+    return {
+        "code": 0,
+        "message": "成功",
+        "data": {
+            "rawText": extracted.text,
+            "pageCount": extracted.page_count,
+            "summary": parsed["summary"],
+            "structured": parsed["structured"],
+            "skills": parsed["skills"],
+            "truncated": parsed["truncated"],
+        },
+    }
+
+
+# ---------- 职位 JD ----------
+
+
+class JobParseRequest(BaseModel):
+    """JD 解析请求。
+
+    ⚠️ 和简历不同，这里传的是【文本】而不是文件地址：
+    JD 本来就是用户粘贴的一段文字（存在 job.raw_content 里），
+    Java 直接带过来就行，不用下载、不用文本提取。
+    """
+
+    userId: str = Field(description="调用方已确认的用户 id（本服务只用于日志，不校验权限）")
+    jobId: str = Field(description="职位 id（仅用于日志）")
+    text: str = Field(min_length=1, description="JD 原文")
+
+
+@router.post("/jobs/parse", summary="解析职位 JD 为结构化数据")
+async def job_parse(req: JobParseRequest) -> dict:
+    """把 JD 文本结构化成技能 / 经验 / 学历 / 职责。
+
+    文档 §十七 的内部接口清单里没列这个（只列了 Resume AI 和 Interview AI），
+    但阶段 12 的 POST /api/app/jobs/{id}/parse 需要它，所以补上。
+    """
+    parsed = await job.parse_job(req.text)
+
+    logger.info("JD 解析：user=%s job=%s → %d 项技能、%d 条职责",
+                req.userId, req.jobId,
+                len(parsed["skills"]), len(parsed["structured"]["responsibilities"]))
+
+    return {
+        "code": 0,
+        "message": "成功",
+        "data": {
+            "summary": parsed["summary"],
+            "structured": parsed["structured"],
+            "skills": parsed["skills"],
+            "truncated": parsed["truncated"],
+        },
+    }

@@ -13,6 +13,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager, suppress
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -20,6 +21,9 @@ from fastapi.responses import JSONResponse
 from app.api import health, internal
 from app.clients.java_client import java_client
 from app.config import PROJECT_ROOT, settings
+from app.services.json_utils import JsonExtractError
+from app.services.llm import LlmCallError
+from app.services.parser import ParseError, UnsupportedFileTypeError
 from app.worker.poller import poll_loop
 
 logging.basicConfig(
@@ -163,4 +167,117 @@ async def validation_error_handler(_: Request, exc: RequestValidationError) -> J
     return JSONResponse(
         status_code=400,
         content={"code": 40001, "message": detail, "data": None},
+    )
+
+
+@app.exception_handler(LlmCallError)
+async def llm_call_error_handler(_: Request, exc: LlmCallError) -> JSONResponse:
+    """调用大模型失败 → 502。
+
+    ⚠️ 必须返回 502 而不是 500：这是【上游依赖不可用】，
+    运维该去查模型服务的连通性 / 额度 / key，而不是查本服务的代码。
+    混成 500 会把排查方向带偏。
+
+    对齐 Java 的 ErrorCode：50202 = LLM 调用失败。
+    """
+    logger.error("调用大模型失败：%s", exc)
+    return JSONResponse(
+        status_code=502,
+        content={"code": 50202, "message": str(exc), "data": None},
+    )
+
+
+@app.exception_handler(JsonExtractError)
+async def json_extract_error_handler(_: Request, exc: JsonExtractError) -> JSONResponse:
+    """模型没按约定输出 JSON → 502。
+
+    ⚠️ 这个 handler 必须注册在 ValueError 之前被匹配到 ——
+    Starlette 按异常类的 MRO 查找 handler，JsonExtractError 是 ValueError 的子类，
+    所以它自己的 handler 会优先命中。注册顺序不影响，类型具体度决定。
+
+    为什么不能让它落到 ValueError 那个 handler：那会返回 400「参数不合法」，
+    但参数明明是对的 —— 是【模型输出跑偏了】。
+    Java 侧看到 400 会以为是自己的请求有问题，方向又错了。
+    """
+    logger.error("模型输出不是合法 JSON：%s", exc)
+    return JSONResponse(
+        status_code=502,
+        content={
+            "code": 50201,
+            "message": "模型没有按约定返回结构化数据，请重试或检查提示词",
+            "data": None,
+        },
+    )
+
+
+# ---------- 文件解析失败 ----------
+#
+# 这两类不注册的话会走 FastAPI 默认，返回 500 + {"detail": ...}，
+# 格式和 {code, message, data} 对不上 —— Java 侧解析不了，只能报「AI 服务返回异常状态」。
+#
+# 都用 422 + 42201（Java 的 FILE_TYPE_UNSUPPORTED）：对用户来说
+# 「这个 PDF 是扫描件、读不出文字」和「不支持这种文件」是同一件事 ——
+# 都是「这个文件我们处理不了」。具体原因由 message 说清楚。
+
+_FILE_UNREADABLE_CODE = 42201
+
+
+@app.exception_handler(UnsupportedFileTypeError)
+async def unsupported_file_type_handler(_: Request, exc: UnsupportedFileTypeError) -> JSONResponse:
+    logger.warning("文件类型不支持：%s", exc)
+    return JSONResponse(
+        status_code=422,
+        content={"code": _FILE_UNREADABLE_CODE, "message": str(exc), "data": None},
+    )
+
+
+@app.exception_handler(ParseError)
+async def parse_error_handler(_: Request, exc: ParseError) -> JSONResponse:
+    logger.warning("文件解析失败：%s", exc)
+    return JSONResponse(
+        status_code=422,
+        content={"code": _FILE_UNREADABLE_CODE, "message": str(exc), "data": None},
+    )
+
+
+# ---------- 下载文件失败 ----------
+#
+# 不注册的话 httpx 的异常会走 FastAPI 默认 → 500 + {"detail": ...}，
+# 格式和 {code, message, data} 对不上，Java 侧解析不了。
+
+
+@app.exception_handler(httpx.HTTPStatusError)
+async def http_status_error_handler(_: Request, exc: httpx.HTTPStatusError) -> JSONResponse:
+    """对象存储返回了错误状态 → 422。
+
+    最常见的原因是【预签名 URL 过期】—— Java 签发的下载地址有有效期，
+    文件在队列里待久了就会失效。这不是本服务的错，也不是调用方参数写错，
+    但对用户来说就是「文件读不到了」，所以给一句能指导行动的话（重试）。
+
+    ⚠️ 不能只回「HTTP 403」：那样用户和排查的人都不知道该干什么。
+    """
+    logger.warning("下载文件失败：HTTP %s %s",
+                   exc.response.status_code, exc.request.url)
+    return JSONResponse(
+        status_code=422,
+        content={
+            "code": _FILE_UNREADABLE_CODE,
+            "message": f"文件下载失败（HTTP {exc.response.status_code}）——"
+                       f"下载地址可能已过期，请重试",
+            "data": None,
+        },
+    )
+
+
+@app.exception_handler(httpx.RequestError)
+async def http_request_error_handler(_: Request, exc: httpx.RequestError) -> JSONResponse:
+    """连不上对象存储 → 502。
+
+    和上面区分开：那个是「存储说不行」，这个是「根本连不上」——
+    前者该重试或换地址，后者该去查网络 / 存储服务状态。
+    """
+    logger.error("连接对象存储失败：%s", exc)
+    return JSONResponse(
+        status_code=502,
+        content={"code": 50201, "message": "连接文件存储失败，请稍后重试", "data": None},
     )

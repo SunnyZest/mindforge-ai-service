@@ -20,6 +20,18 @@ _TIMEOUT_SECONDS = 120.0
 _KEY_NOT_CONFIGURED = "NOT_CONFIGURED"
 
 
+class LlmCallError(RuntimeError):
+    """调用大模型失败（网络、鉴权、限流、返回空结果等）。
+
+    单独定义而不是直接抛 RuntimeError，是为了让上层能**区分**这件事：
+    调用模型失败是「上游依赖不可用」（该返回 502），
+    而 RuntimeError 还可能是本服务自己的代码 bug（该返回 500）。
+    两者混在一起的话，运维看到 500 会去查自己的代码，方向就错了。
+
+    继承 RuntimeError 是兼容考虑 —— 已有的 `except RuntimeError` 照样能接住。
+    """
+
+
 class LlmService:
     """对话模型。"""
 
@@ -33,7 +45,7 @@ class LlmService:
     @staticmethod
     def _ensure_configured() -> None:
         if not settings.dashscope_api_key:
-            raise RuntimeError(
+            raise LlmCallError(
                 "DASHSCOPE_API_KEY 未配置，无法调用对话模型。"
                 "请在项目根目录的 .env 里填写（注意：本项目用 DashScope 的 "
                 "OpenAI 兼容接口，配的是 DASHSCOPE_API_KEY，不是 OPENAI_API_KEY）"
@@ -70,12 +82,12 @@ class LlmService:
                 max_tokens=max_tokens or settings.chat_max_tokens,
             )
         except Exception as exc:                     # noqa: BLE001
-            raise RuntimeError(
+            raise LlmCallError(
                 f"对话模型调用失败：{type(exc).__name__}: {exc}"
             ) from exc
 
         if not resp.choices:
-            raise RuntimeError("对话模型返回了空结果")
+            raise LlmCallError("对话模型返回了空结果")
 
         answer = (resp.choices[0].message.content or "").strip()
 

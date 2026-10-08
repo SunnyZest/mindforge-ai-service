@@ -11,19 +11,15 @@
 
 import logging
 
-import httpx
-
 from app.clients.java_client import java_client
 from app.config import settings
+from app.services.downloader import download_bytes
 from app.services.embedding import embedding_service
 from app.services.parser import ParseError, UnsupportedFileTypeError, parse
 from app.services.splitter import estimate_tokens, split
 from app.services.vector_store import vector_store
 
 logger = logging.getLogger(__name__)
-
-# 下载文件的超时：文档可能几十 MB，给宽一点
-_DOWNLOAD_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0)
 
 
 async def process_document(task: dict) -> bool:
@@ -49,8 +45,7 @@ async def process_document(task: dict) -> bool:
     try:
         # ---------- ① 下载 ----------
         # Java 给的是 OSS 的预签名 URL，所以本服务不需要配任何 OSS 密钥。
-        # 走默认的 httpx（trust_env=True）—— OSS 是公网地址，有代理的话应该走代理。
-        content = await _download(task["downloadUrl"])
+        content = await download_bytes(task["downloadUrl"])
         logger.info("  ① 下载完成：%d 字节", len(content))
 
         # ---------- ② 解析 ----------
@@ -142,13 +137,6 @@ async def process_document(task: dict) -> bool:
 
 
 # ---------- 内部 ----------
-
-
-async def _download(url: str) -> bytes:
-    async with httpx.AsyncClient(timeout=_DOWNLOAD_TIMEOUT, follow_redirects=True) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        return resp.content
 
 
 async def _mark_failed(document_id, message: str) -> None:
