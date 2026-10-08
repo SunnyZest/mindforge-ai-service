@@ -9,32 +9,21 @@ Java 已经查好权限并把确认过的 userId / knowledgeBaseId 传进来。
 import logging
 
 from app.config import settings
-from app.services import rag
+from app.services import prompt, rag
 from app.services.llm import llm_service
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT_TEMPLATE = """你是 MindForge AI 的文档问答助手。
-
-请严格按以下规则回答：
-
-1. **只根据下面【参考资料】里的内容回答。**
-   资料里没有的信息，直接回答「提供的资料中没有找到相关内容」——
-   不要用你自己的知识补充，也不要猜测或编造。
-2. 回答用中文，准确、简洁，不要啰嗦。
-3. 如果资料之间互相矛盾，明确指出来。
-4. 不要编造引用编号或出处 —— 引用信息由系统单独返回给前端。
-5. 如果用户的问题和资料完全无关，直接说明。
-
-【参考资料】
-{context}"""
-
-# 检索不到时直接返回的兜底话术
-_NO_RESULT_ANSWER = "提供的资料中没有找到相关内容。请尝试换个说法，或者确认相关内容是否已上传到该知识库。"
-
-# 上面这句话的「核心部分」—— 用来判断模型的回答是不是「没找到」。
-# 刻意只取前半句：模型可能会在后面补充建议，但开头是固定的。
+#   _NO_RESULT_MARKER 是【代码契约】—— hasAnswer 靠它判断模型有没有给出实质回答。
+#   如果有人把它当普通文案改了措辞，判断会静默失效：不报错，
+#   只是 hasAnswer 永远为 True，前端于是把「资料里没有」当成有效答案展示出来。
+#
+#   可改的文案（system prompt）在 prompts/rag_chat.txt；
+#   这里的是逻辑依赖的字符串，改了要同步改判断逻辑。
 _NO_RESULT_MARKER = "提供的资料中没有找到相关内容"
+
+# 检索不到时直接返回给用户的兜底话术（注意开头必须包含上面的 marker）
+_NO_RESULT_ANSWER = _NO_RESULT_MARKER + "请尝试换个说法，或者确认相关内容是否已上传到该知识库。"
 
 
 async def chat(
@@ -100,7 +89,8 @@ async def chat(
 
     # ---------- ② 拼 prompt ----------
     context, truncated = _build_context(sources)
-    system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(context=context)
+    # 提示词在 prompts/rag_chat.txt —— 改文案不用动代码
+    system_prompt = prompt.render("rag_chat", context=context)
 
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
     messages.extend(_trim_history(history))
