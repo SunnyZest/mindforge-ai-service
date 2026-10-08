@@ -78,6 +78,7 @@ class EmbeddingService:
         vectors: list[list[float]] = []
 
         for start in range(0, len(cleaned), batch_size):
+            # 一次处理的条数(长度)
             batch = cleaned[start:start + batch_size]
             try:
                 resp = await self._client.embeddings.create(
