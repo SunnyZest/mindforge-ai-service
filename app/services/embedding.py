@@ -34,6 +34,20 @@ _EMPTY_PLACEHOLDER = "（空）"
 _KEY_NOT_CONFIGURED = "NOT_CONFIGURED"
 
 
+class EmbeddingCallError(RuntimeError):
+    """调用嵌入模型失败（网络、鉴权、限流、返回数量不对等）。
+
+    和 `llm.LlmCallError` 是同一个思路：把「上游依赖不可用」和「本服务代码 bug」分开。
+    ⚠️ 不分开的话，向量化失败（key 过期 / 额度用完 / 网络不通）会报成 500，
+    运维去查自己的代码 —— 方向全错。
+
+    继承 RuntimeError 是兼容考虑：已有的 `except RuntimeError` 照样能接住。
+
+    ⚠️ 这个异常会【穿透到检索】—— 因为 rag.search 第一步就是嵌入查询词。
+    所以对话接口遇到它，表现是「连引用都拿不到」，而不是「引用有、答案没有」。
+    """
+
+
 class EmbeddingService:
     """文本 → 向量。"""
 
@@ -48,7 +62,7 @@ class EmbeddingService:
     def _ensure_configured() -> None:
         """调用前检查 key —— 报错要说清是哪个配置项，别让人去猜。"""
         if not settings.dashscope_api_key:
-            raise RuntimeError(
+            raise EmbeddingCallError(
                 "DASHSCOPE_API_KEY 未配置，无法调用嵌入模型。"
                 "请在项目根目录的 .env 里填写（注意：本项目用 DashScope 的 "
                 "OpenAI 兼容接口，配的是 DASHSCOPE_API_KEY，不是 OPENAI_API_KEY）"
@@ -86,7 +100,7 @@ class EmbeddingService:
                     input=batch,
                 )
             except Exception as exc:                    # noqa: BLE001
-                raise RuntimeError(
+                raise EmbeddingCallError(
                     f"嵌入失败（第 {start // batch_size + 1} 批，共 {len(batch)} 条）："
                     f"{type(exc).__name__}: {exc}"
                 ) from exc
@@ -96,7 +110,7 @@ class EmbeddingService:
             vectors.extend([d.embedding for d in ordered])
 
         if len(vectors) != len(texts):
-            raise RuntimeError(
+            raise EmbeddingCallError(
                 f"嵌入结果数量不对：期望 {len(texts)} 条，实际 {len(vectors)} 条"
             )
 

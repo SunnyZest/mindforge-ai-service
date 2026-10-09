@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from app.api import health, internal
 from app.clients.java_client import java_client
 from app.config import PROJECT_ROOT, settings
+from app.services.embedding import EmbeddingCallError
 from app.services.json_utils import JsonExtractError
 from app.services.llm import LlmCallError
 from app.services.parser import ParseError, UnsupportedFileTypeError
@@ -280,4 +281,46 @@ async def http_request_error_handler(_: Request, exc: httpx.RequestError) -> JSO
     return JSONResponse(
         status_code=502,
         content={"code": 50201, "message": "连接文件存储失败，请稍后重试", "data": None},
+    )
+
+
+@app.exception_handler(EmbeddingCallError)
+async def embedding_call_error_handler(_: Request, exc: EmbeddingCallError) -> JSONResponse:
+    """调用嵌入模型失败 → 502。
+
+    和 LlmCallError 一样是「上游依赖不可用」，所以也是 502 不是 500。
+
+    ⚠️ 这个 handler 特别重要：嵌入是【检索的第一步】，
+    它挂了的表现是「连引用片段都拿不到」—— 如果不注册，
+    会走 FastAPI 默认的 500 + {"detail": ...}，Java 侧解析不了，
+    最后报出来的是「AI 服务返回异常状态」，完全看不出是嵌入的问题。
+    """
+    logger.error("调用嵌入模型失败：%s", exc)
+    return JSONResponse(
+        status_code=502,
+        content={
+            "code": 50202,
+            "message": f"向量化失败（检索用不了）：{exc}",
+            "data": None,
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(_: Request, exc: Exception) -> JSONResponse:
+    """兜底：任何没被上面接住的异常 → 500 + 【统一信封】。
+
+    ⚠️ 不注册这个的话，未预期的异常会走 FastAPI 默认，
+    返回 `500 + {"detail": "Internal Server Error"}` —— 格式和
+    `{code, message, data}` 对不上，Java 侧直接解析失败，
+    最后用户看到的是「AI 服务返回异常状态」，根本不知道发生了什么。
+
+    ⚠️ 只回一句人话，**不把异常内容返回给调用方** ——
+    未预期异常的内容可能带内部路径、SQL、甚至配置片段。
+    完整信息在服务日志里（logger.exception 会打堆栈）。
+    """
+    logger.exception("未处理的异常（这是本服务的 bug，不是调用方的问题）")
+    return JSONResponse(
+        status_code=500,
+        content={"code": 50000, "message": "AI 服务内部错误", "data": None},
     )
