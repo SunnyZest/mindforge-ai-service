@@ -4,6 +4,7 @@
 """
 
 import logging
+from collections.abc import AsyncIterator
 
 from openai import AsyncOpenAI
 
@@ -105,6 +106,70 @@ class LlmService:
                         resp.usage.completion_tokens or 0)
 
         return answer
+
+    async def chat_stream(
+        self,
+        messages: list[dict],
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+    ) -> AsyncIterator[str]:
+        """流式对话 —— 逐段吐出增量文本。
+
+        ⚠️ 和 chat() 的区别：这里只吐【增量文本】，不吐完整回答、不吐 usage。
+        调用方要自己把增量拼起来（比如 chat.py 靠完整回答判断 hasAnswer）。
+
+        ⚠️ 生成器里抛异常时，HTTP 响应头【已经发出去了】——
+        调用方没法再改状态码，只能把错误当成流里的一个事件发出去。
+        见 internal.py 的 /rag/chat/stream。
+
+        Args:
+            messages: OpenAI 格式的消息列表
+            temperature: 温度，默认用 settings.chat_temperature
+            max_tokens: 回答长度上限
+            timeout: 本次调用的超时（秒）
+
+        Yields:
+            文本增量（可能为空串以外的任意片段，不保证按句/按词切）
+
+        Raises:
+            LlmCallError: 调用失败，或者流中途断了
+        """
+        if not messages:
+            raise ValueError("messages 不能为空")
+
+        self._ensure_configured()
+
+        try:
+            stream = await self._client.chat.completions.create(
+                model=settings.chat_model,
+                messages=messages,
+                temperature=settings.chat_temperature if temperature is None else temperature,
+                max_tokens=max_tokens or settings.chat_max_tokens,
+                timeout=timeout,
+                stream=True,
+            )
+        except Exception as exc:                     # noqa: BLE001
+            # 连流都没建起来（鉴权 / 网络 / 限流）—— 这时还没吐过任何东西
+            raise LlmCallError(
+                f"对话模型调用失败：{type(exc).__name__}: {exc}"
+            ) from exc
+
+        try:
+            async for chunk in stream:
+                # 有些 chunk 只带 usage、没有 choices（末尾那一个），要跳过
+                if not chunk.choices:
+                    continue
+                text = chunk.choices[0].delta.content
+                if text:
+                    yield text
+        except Exception as exc:                     # noqa: BLE001
+            # ⚠️ 中途断了 —— 前面已经吐出去的内容收不回来，
+            #    调用方只能把这条错误追加到流末尾，让前端知道「后面没了」。
+            raise LlmCallError(
+                f"流式对话中断：{type(exc).__name__}: {exc}"
+            ) from exc
 
     async def aclose(self) -> None:
         await self._client.close()

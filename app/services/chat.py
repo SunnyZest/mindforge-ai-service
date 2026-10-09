@@ -7,10 +7,11 @@ Java 已经查好权限并把确认过的 userId / knowledgeBaseId 传进来。
 """
 
 import logging
+from collections.abc import AsyncIterator
 
 from app.config import settings
 from app.services import prompt, rag
-from app.services.llm import llm_service
+from app.services.llm import LlmCallError, llm_service
 
 logger = logging.getLogger(__name__)
 
@@ -69,12 +70,7 @@ async def chat(
     # ---------- ① 检索 ----------
     # min_relevance_score 过滤掉明显不相关的片段 ——
     # 宁可不答，也别拿不相关的内容硬凑，那样模型一定会编
-    sources = await rag.search(
-        knowledge_base_id=knowledge_base_id,
-        query=query,
-        top_k=top_k,
-        min_score=settings.min_relevance_score,
-    )
+    sources = await _retrieve(knowledge_base_id, query, top_k)
 
     if not sources:
         # 没检索到就【不调 LLM】—— 既省钱，也避免模型硬答
@@ -88,13 +84,7 @@ async def chat(
         }
 
     # ---------- ② 拼 prompt ----------
-    context, truncated = _build_context(sources)
-    # 提示词在 prompts/rag_chat.txt —— 改文案不用动代码
-    system_prompt = prompt.render("rag_chat", context=context)
-
-    messages: list[dict] = [{"role": "system", "content": system_prompt}]
-    messages.extend(_trim_history(history))
-    messages.append({"role": "user", "content": query.strip()})
+    messages, truncated = _build_messages(sources, query, history)
 
     # ---------- ③ 调模型 ----------
     answer = await llm_service.chat(messages)
@@ -117,7 +107,130 @@ async def chat(
     }
 
 
+async def chat_stream(
+    *,
+    knowledge_base_id: int | str,
+    query: str,
+    top_k: int | None = None,
+    history: list[dict] | None = None,
+) -> AsyncIterator[dict]:
+    """流式版 `chat()` —— 逐段吐事件，而不是攒完一次性返回。
+
+    <b>产出的事件</b>（调用方按 `type` 分支）：
+
+    ```
+    {"type": "sources", "sources": [...], "hasContext": bool, "contextTruncated": bool}
+    {"type": "delta",   "text": "..."}          ← 可能有很多个
+    {"type": "done",    "answer": "...", "hasAnswer": bool}
+    ```
+
+    ★ <b>为什么先把 sources 推出去</b>：检索在调模型【之前】就完成了。
+    先推给前端，用户能立刻看到「参考了哪几段」，不用等模型生成完 ——
+    首屏感知快很多。而且它也是流的第一个字节，能让连接早点建立。
+
+    ⚠️ <b>hasAnswer 只能等流结束才知道</b>：它靠判断完整回答里有没有那句固定话术
+    （见 _NO_RESULT_MARKER），流到一半时答案还没拼完。
+    所以放在 done 事件里 —— 前端可以先照常渲染流式文本，
+    收到 done 再决定要不要换成「没找到」的展示。
+
+    ⚠️ 这个生成器抛异常时，HTTP 响应头【已经发出去了】，
+    调用方没法再改状态码。见 internal.py 里对异常的处理。
+
+    Args:
+        knowledge_base_id: 知识库 id —— **必传**，数据隔离的安全边界
+        query: 用户问题
+        top_k: 检索片段数
+        history: 历史消息，最多取最近 N 轮
+
+    Yields:
+        上面三种事件（dict）
+
+    Raises:
+        ValueError: 查询为空
+        LlmCallError: 模型调用失败或流中断
+    """
+    if not query or not query.strip():
+        raise ValueError("查询内容不能为空")
+
+    # ---------- ① 检索 ----------
+    sources = await _retrieve(knowledge_base_id, query, top_k)
+
+    if not sources:
+        # 和 chat() 一致：没检索到就不调模型，直接把兜底话术当成「一个 delta」吐出去，
+        # 这样前端的渲染路径只有一条（不用为「没有上下文」单独写分支）
+        logger.info("未检索到相关资料，流式返回兜底话术（不调用模型）")
+        yield {
+            "type": "sources",
+            "sources": [],
+            "hasContext": False,
+            "contextTruncated": False,
+        }
+        yield {"type": "delta", "text": _NO_RESULT_ANSWER}
+        yield {"type": "done", "answer": _NO_RESULT_ANSWER, "hasAnswer": False}
+        return
+
+    messages, truncated = _build_messages(sources, query, history)
+
+    yield {
+        "type": "sources",
+        "sources": sources,
+        "hasContext": True,
+        "contextTruncated": truncated,
+    }
+
+    # ---------- ② 边收边吐 ----------
+    # ⚠️ 必须自己把增量拼起来：hasAnswer 要拿完整回答才能判断
+    pieces: list[str] = []
+    async for piece in llm_service.chat_stream(messages):
+        pieces.append(piece)
+        yield {"type": "delta", "text": piece}
+
+    answer = "".join(pieces)
+    has_answer = _NO_RESULT_MARKER not in answer
+
+    logger.info("流式对话完成：kb=%s，参考 %d 个片段，hasAnswer=%s，回答 %d 字（%d 段）%s",
+                knowledge_base_id, len(sources), has_answer, len(answer), len(pieces),
+                "（参考资料被截断）" if truncated else "")
+
+    yield {"type": "done", "answer": answer, "hasAnswer": has_answer}
+
+
 # ---------- 内部 ----------
+
+
+async def _retrieve(
+    knowledge_base_id: int | str,
+    query: str,
+    top_k: int | None,
+) -> list[dict]:
+    """检索相关片段。
+
+    `chat()` 和 `chat_stream()` 共用 —— 抽出来是为了保证两条路径
+    用的是同一套检索参数（尤其 min_relevance_score，
+    改一处漏一处的话，流式和非流式会给出不一样的结果）。
+    """
+    return await rag.search(
+        knowledge_base_id=knowledge_base_id,
+        query=query,
+        top_k=top_k,
+        min_score=settings.min_relevance_score,
+    )
+
+
+def _build_messages(
+    sources: list[dict],
+    query: str,
+    history: list[dict] | None,
+) -> tuple[list[dict], bool]:
+    """把检索结果拼成 messages。返回 (messages, 参考资料是否被截断)。"""
+    context, truncated = _build_context(sources)
+    # 提示词在 prompts/rag_chat.txt —— 改文案不用动代码
+    system_prompt = prompt.render("rag_chat", context=context)
+
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    messages.extend(_trim_history(history))
+    messages.append({"role": "user", "content": query.strip()})
+    return messages, truncated
 
 
 def _build_context(sources: list[dict]) -> tuple[str, bool]:
