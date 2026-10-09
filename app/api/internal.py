@@ -11,14 +11,18 @@ Java 在调过来之前已经完成了权限检查，并把确认过的 userId /
 这样 Java 侧不用为「调 Python」单独写一套解析。
 """
 
+import json
 import logging
 
 from fastapi import APIRouter, Depends
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.core.security import verify_service_token
-from app.services import chat, job, rag, resume
+from app.services import chat, interview, job, rag, resume
 from app.services.downloader import download_bytes
+from app.services.embedding import EmbeddingCallError
+from app.services.llm import LlmCallError
 from app.services.parser import parse
 
 logger = logging.getLogger(__name__)
@@ -123,6 +127,105 @@ async def rag_chat(req: RagChatRequest) -> dict:
     return {"code": 0, "message": "成功", "data": result}
 
 
+# ---------- SSE 流式对话 ----------
+#
+# ★ 和上面 /rag/chat 的关系：走的是同一个逻辑（chat.chat_stream），只是输出方式不同。
+#   前端要「打字机效果」就走这个；要一次性拿完整结果就走上面那个。
+#
+# ⚠️ 两个必须知道的约束：
+#   ① HTTP 状态码【只能是 200】—— 响应头在第一个字节发出时就定死了。
+#      所以「检索失败」「模型报错」这些都没法用状态码表达，统一走 error 事件。
+#      **前端必须处理 error 事件**，否则出错了它会一直转圈。
+#   ② 只有【对话】做流式。解析 / 分析类（resumes/parse、interviews/*）不做 ——
+#      它们的输出是一整个 JSON，流到一半的 JSON 没法用。
+
+
+def _sse(event: str, payload: dict) -> str:
+    """拼一条 SSE 消息。
+
+    ⚠️ data 里【也带了 type 字段】，和 event 名重复。这是刻意的：
+    Java 侧是手动逐行读这个流的（RestClient 不认 SSE），
+    看 data 里的 type 比解析 event 字段省事；而且有些客户端只认 data。
+    """
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+@router.post("/rag/chat/stream", summary="基于知识库的问答（SSE 流式）")
+async def rag_chat_stream(req: RagChatRequest) -> StreamingResponse:
+    """流式版 /rag/chat。返回 `text/event-stream`，逐段推送。
+
+    事件序列：
+
+    ```
+    event: sources   data: {"type","sources","hasContext","contextTruncated"}
+    event: delta     data: {"type","text"}              ← 很多个
+    event: done      data: {"type","answer","hasAnswer"}
+    event: error     data: {"type","code","message"}    ← 出问题时【代替】done
+    ```
+
+    ⚠️ 出问题时一定是「先 200，再发 error 事件」—— 见上面第 ① 条约束。
+    """
+
+    async def event_source():
+        try:
+            async for evt in chat.chat_stream(
+                knowledge_base_id=req.knowledgeBaseId,
+                query=req.query,
+                top_k=req.topK,
+                history=[h.model_dump() for h in req.history],
+            ):
+                yield _sse(evt["type"], evt)
+
+        except ValueError as exc:
+            # 参数问题（查询为空之类）—— pydantic 理论上已经挡住了，兜个底
+            logger.warning("流式对话参数不合法：%s", exc)
+            yield _sse("error", {"type": "error", "code": 40001, "message": str(exc)})
+
+        except EmbeddingCallError as exc:
+            # ★ 这个分支是【检索阶段】失败的 —— 嵌入查询词是检索的第一步，
+            #   它挂了就连引用片段都拿不到，所以此时还没发过 sources 事件。
+            logger.error("流式对话向量化失败：%s", exc)
+            yield _sse("error", {
+                "type": "error",
+                "code": 50202,
+                "message": f"检索失败（向量化不可用）：{exc}",
+            })
+
+        except LlmCallError as exc:
+            # ⚠️ 模型可能是【吐到一半才失败】的，这时前端已经渲染了部分文本。
+            #    message 要说清「已输出的那部分可能不完整」，
+            #    否则用户会把半截回答当成完整答案。
+            logger.error("流式对话模型调用失败：%s", exc)
+            yield _sse("error", {
+                "type": "error",
+                "code": 50202,
+                "message": f"AI 回答中断：{exc}（已输出的部分可能不完整）",
+            })
+
+        except Exception as exc:                     # noqa: BLE001
+            logger.exception("流式对话出现未预期错误")
+            yield _sse("error", {
+                "type": "error",
+                "code": 50000,
+                "message": f"服务内部错误：{type(exc).__name__}",
+            })
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={
+            # ⚠️ 这三个头都不能少：
+            #   no-cache           别让浏览器 / 代理缓存这条流
+            #   X-Accel-Buffering  让 nginx 不要缓冲 —— 不设的话它会攒够一批才发，
+            #                      流式就白做了（本地直连看不出，一上 nginx 就露馅）
+            #   keep-alive         明确告诉中间层这是长连接
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
 # ---------- 简历 ----------
 
 
@@ -216,3 +319,166 @@ async def job_parse(req: JobParseRequest) -> dict:
             "truncated": parsed["truncated"],
         },
     }
+
+
+# ---------- 简历分析（优化建议）----------
+
+
+class ResumeAnalyzeRequest(BaseModel):
+    """简历分析请求。
+
+    ⚠️ 传【文本】而不是 resumeId：本服务不连数据库（数据访问全在 Java），
+    Java 把已经存好的 resume.raw_content / job.raw_content 带过来就行。
+    """
+
+    userId: str = Field(description="调用方已确认的用户 id（本服务只用于日志，不校验权限）")
+    resumeId: str = Field(description="简历 id（仅用于日志）")
+    resumeText: str = Field(min_length=1, description="简历原文")
+    jobText: str | None = Field(
+        default=None, description="目标岗位 JD 原文，可空（不针对具体岗位时按通用标准评）")
+    target: str | None = Field(
+        default=None,
+        description="本次重点分析的部分：SUMMARY / WORK_EXPERIENCE / "
+                    "PROJECT_EXPERIENCE / SKILLS / EDUCATION / OVERALL，可空 = 整体",
+    )
+
+
+@router.post("/resumes/analyze", summary="针对岗位给出简历改进建议")
+async def resume_analyze(req: ResumeAnalyzeRequest) -> dict:
+    """给改进建议 —— <b>只给建议，不改写简历本身，也不落库</b>。
+
+    ⚠️ 返回值里 `needs_fact=true` 的条目表示「这里缺事实，需要用户自己补」——
+    前端**要把它和普通改写建议分开展示**，不能混在一起。
+    原因见 prompts/resume_analyze.txt 开头那段：编造出来的经历
+    会让用户在面试时被追问两句就露馅，比不改还糟。
+    """
+    result = await resume.analyze_resume(
+        req.resumeText,
+        job_text=req.jobText,
+        target=req.target,
+    )
+
+    need_fact = sum(1 for i in result["items"] if i["needsFact"])
+    logger.info("简历分析：user=%s resume=%s → %d 条建议（%d 条待补事实）",
+                req.userId, req.resumeId, len(result["items"]), need_fact)
+
+    return {"code": 0, "message": "成功", "data": result}
+
+
+# ---------- AI 面试 ----------
+
+
+class InterviewGenerateRequest(BaseModel):
+    """出题请求。"""
+
+    userId: str = Field(description="调用方已确认的用户 id（本服务只用于日志，不校验权限）")
+    interviewId: str = Field(description="面试 id（仅用于日志）")
+    interviewType: str = Field(
+        default="TECHNICAL", description="TECHNICAL / BEHAVIORAL / MIXED")
+    difficulty: str = Field(default="MEDIUM", description="EASY / MEDIUM / HARD")
+    questionCount: int = Field(default=5, ge=1, le=20, description="题目数量")
+    resumeText: str | None = Field(default=None, description="候选人简历原文，可空")
+    jobText: str | None = Field(default=None, description="目标岗位 JD 原文，可空")
+
+
+@router.post("/interviews/generate", summary="根据简历和 JD 出面试题")
+async def interview_generate(req: InterviewGenerateRequest) -> dict:
+    """一次性出完所有题目。
+
+    ⚠️ 每题都带 `expectedPoints`（参考答案要点）—— Java 要把它存进
+    `interview_question.expected_points`，后面调 /interviews/analyze 时再带回来。
+    **没有这个参照物，模型对同一份回答的打分会飘**（这次 70 下次 85）。
+    """
+    result = await interview.generate_questions(
+        resume_text=req.resumeText,
+        job_text=req.jobText,
+        interview_type=req.interviewType,
+        difficulty=req.difficulty,
+        question_count=req.questionCount,
+    )
+
+    logger.info("面试出题：user=%s interview=%s → %d 道题",
+                req.userId, req.interviewId, len(result["questions"]))
+
+    return {"code": 0, "message": "成功", "data": result}
+
+
+class InterviewAnalyzeRequest(BaseModel):
+    """单题评分请求。"""
+
+    userId: str = Field(description="调用方已确认的用户 id（本服务只用于日志，不校验权限）")
+    interviewId: str = Field(description="面试 id（仅用于日志）")
+    question: str = Field(min_length=1, description="题目")
+    answer: str = Field(
+        default="",
+        description="候选人的回答。⚠️ 允许空 —— 跳过一道题是正常行为，应该给低分而不是报错",
+    )
+    expectedPoints: list[str] = Field(
+        default_factory=list, description="参考答案要点（出题时存下来的），建议带上")
+    interviewType: str = Field(default="TECHNICAL", description="面试类型")
+
+
+@router.post("/interviews/analyze", summary="评估候选人对单道题的回答")
+async def interview_analyze(req: InterviewAnalyzeRequest) -> dict:
+    """给一道题的回答打分 + 分析。
+
+    ⚠️ 空回答【不报错】—— 返回一个低分结果，让流程继续走完。
+    报错的话用户跳过一道题就整场面试卡住了。
+    """
+    result = await interview.analyze_answer(
+        question=req.question,
+        answer=req.answer,
+        expected_points=req.expectedPoints,
+        interview_type=req.interviewType,
+    )
+
+    logger.info("答题分析：user=%s interview=%s → 得分 %s，漏 %d 个要点",
+                req.userId, req.interviewId, result["score"],
+                len(result["missingPoints"]))
+
+    return {"code": 0, "message": "成功", "data": result}
+
+
+class InterviewReportItem(BaseModel):
+    """报告里的单题记录。"""
+
+    questionNo: int = Field(description="题号")
+    question: str = Field(description="题目")
+    answer: str | None = Field(default=None, description="候选人的回答")
+    score: float | None = Field(default=None, description="本题得分")
+    analysis: dict | None = Field(
+        default=None,
+        description="本题的分析结果（/interviews/analyze 的返回）。"
+                    "⚠️ 建议带上 —— 报告要求「四个分数和逐题得分对得上」，"
+                    "没有逐题分模型只能瞎给，用户会发现「每题都 80 综合却给 60」",
+    )
+
+
+class InterviewReportRequest(BaseModel):
+    """总报告请求。"""
+
+    userId: str = Field(description="调用方已确认的用户 id（本服务只用于日志，不校验权限）")
+    interviewId: str = Field(description="面试 id（仅用于日志）")
+    interviewType: str = Field(default="TECHNICAL", description="面试类型")
+    jobTitle: str | None = Field(default=None, description="目标岗位名，可空")
+    items: list[InterviewReportItem] = Field(
+        min_length=1, description="逐题记录，至少一条")
+
+
+@router.post("/interviews/report", summary="根据整场问答生成复盘报告")
+async def interview_report(req: InterviewReportRequest) -> dict:
+    """生成复盘报告。
+
+    返回的字段直接对齐 `interview_report` 表：
+    四个分数 + strengths/weaknesses/suggestions 三个数组 + reportText（Markdown）。
+    """
+    result = await interview.build_report(
+        items=[item.model_dump() for item in req.items],
+        interview_type=req.interviewType,
+        job_title=req.jobTitle,
+    )
+
+    logger.info("面试报告：user=%s interview=%s → 综合 %s（%d 道题）",
+                req.userId, req.interviewId, result["overallScore"], len(req.items))
+
+    return {"code": 0, "message": "成功", "data": result}

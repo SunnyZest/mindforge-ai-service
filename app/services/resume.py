@@ -197,3 +197,146 @@ def _normalize_skills(value: Any) -> list[dict[str, Any]]:
             "years": clean_float(item.get("years"), hi=99.9),
         })
     return result
+
+
+# ---------- 简历分析（优化建议）----------
+#
+# ⚠️ 和上面的 parse 是【两件事】：
+#   parse   —— 从简历里【提取事实】，结果要落库
+#   analyze —— 针对目标岗位给【改进建议】，结果给人看，用户自己决定采不采纳
+# 所以 analyze 不落库、不覆盖任何东西。
+
+# 建议针对简历的哪个部分，和 Java 侧 /resumes/{id}/optimize 的 target 参数对齐
+_ANALYZE_TARGETS = {
+    "SUMMARY", "WORK_EXPERIENCE", "PROJECT_EXPERIENCE",
+    "SKILLS", "EDUCATION", "OVERALL",
+}
+
+# 最多返回几条建议。太多会让用户不知道先改哪个
+_MAX_ANALYZE_ITEMS = 8
+
+# 分析时喂给模型的 JD 上限 —— 用不着整篇 JD，岗位要求通常在前 2000 字里
+_MAX_JOB_CHARS = 4000
+
+
+async def analyze_resume(
+    text: str,
+    *,
+    job_text: str | None = None,
+    target: str | None = None,
+) -> dict[str, Any]:
+    """针对目标岗位给出简历改进建议。
+
+    ★ <b>防虚构</b>：缺事实的地方标 `needs_fact=True`，让模型说清「要补什么」，
+    而不是替用户编一个结果。约束写在 prompts/resume_analyze.txt 里，
+    这里再做一道兜底（见 _normalize_analysis）。
+
+    Args:
+        text: 简历原文
+        job_text: 目标 JD 原文，可空（不针对具体岗位时按通用标准评）
+        target: 本次重点分析的部分，可空 = 整体
+
+    Returns:
+        {   # ⚠️ 键用 camelCase，理由见 _normalize_analysis 的说明
+          "overallScore": float | None,
+          "summary": str | None,
+          "highlights": [...],
+          "items": [...],      # 每条含 needsFact / missingFact
+          "truncated": bool,
+        }
+
+    Raises:
+        ValueError: 文本为空
+        JsonExtractError: 模型没按格式输出
+        LlmCallError: 模型调用失败
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        raise ValueError("简历文本为空，无法分析")
+
+    truncated = len(cleaned) > _MAX_RESUME_CHARS
+    if truncated:
+        logger.warning("简历文本 %d 字符，超过上限 %d，已截断",
+                       len(cleaned), _MAX_RESUME_CHARS)
+        cleaned = cleaned[:_MAX_RESUME_CHARS]
+
+    job_clean = (job_text or "").strip()[:_MAX_JOB_CHARS]
+
+    system_prompt = prompt.render(
+        "resume_analyze",
+        resume_text=cleaned,
+        # ⚠️ 必须给个非空字符串：prompt.render 不允许占位符是空的
+        job_text=job_clean or "（未提供，按通用标准评）",
+        target=target or "OVERALL",
+    )
+
+    raw = await llm_service.chat(
+        [{"role": "system", "content": system_prompt}],
+        temperature=_EXTRACT_TEMPERATURE,
+        max_tokens=settings.extract_max_tokens,
+        timeout=settings.extract_timeout_seconds,
+    )
+
+    result = _normalize_analysis(extract_json_object(raw))
+
+    logger.info("简历分析完成：%d 条建议，其中 %d 条需要用户补事实",
+                len(result["items"]),
+                sum(1 for i in result["items"] if i["needsFact"]))
+
+    return {**result, "truncated": truncated}
+
+
+def _normalize_analysis(raw: dict[str, Any]) -> dict[str, Any]:
+    """规范化分析结果。
+
+    ⚠️ <b>输出的键用 camelCase</b> —— 这不是笔误，也不是不 Pythonic：
+    这个返回值会【原样作为 HTTP 响应】给 Java，而 Java 侧的 record 字段是 camelCase
+    （`overallScore` / `needsFact`）。用 snake_case 的话 Jackson 对不上，
+    那些字段会静默变成 null —— 接口看起来「通了」，但数据全是空的。
+    和 resume._normalize() 的做法一致（那边也是 camelCase，对齐 Java 的 VO）。
+    """
+    items: list[dict[str, Any]] = []
+    for item in clean_dict_list(raw.get("items"), limit=_MAX_ANALYZE_ITEMS):
+        original = clean_str(item.get("original"), max_len=1000)
+        suggestion = clean_str(item.get("suggestion"), max_len=1000)
+        # 原文和建议都拿不到的条目没有意义 —— 用户看不出在说哪一句
+        if original is None and suggestion is None:
+            continue
+
+        needs_fact = _as_bool(item.get("needsFact"))
+        items.append({
+            "target": clean_enum(item.get("target"), _ANALYZE_TARGETS),
+            "original": original,
+            "issue": clean_str(item.get("issue"), max_len=1000),
+            "suggestion": suggestion,
+            # ★ 兜底：要补事实的条目，rewritten 一律置空。
+            #   模型有时候「嘴上标了 needsFact，rewritten 里却已经编好了」——
+            #   那是编造的内容，绝不能漏到前端去。
+            "rewritten": None if needs_fact
+                         else clean_str(item.get("rewritten"), max_len=2000),
+            "needsFact": needs_fact,
+            "missingFact": clean_str(item.get("missingFact"), max_len=500)
+                           if needs_fact else None,
+        })
+
+    return {
+        "overallScore": clean_float(raw.get("overallScore"), lo=0, hi=100),
+        "summary": clean_str(raw.get("summary"), max_len=1000),
+        "highlights": clean_str_list(raw.get("highlights"), item_max_len=255, limit=10),
+        "items": items,
+    }
+
+
+def _as_bool(value: Any) -> bool:
+    """把模型返回的「真假」统一成 bool。
+
+    ⚠️ 不能直接 bool(value)：`bool("false")` 是 True —— 模型很爱把布尔写成字符串，
+    直接用的话「不需要补事实」会被判成「需要」，建议全被吞掉。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "y", "1", "是"}
+    if isinstance(value, (int, float)):
+        return value != 0
+    return False
