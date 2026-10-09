@@ -7,6 +7,7 @@
 import logging
 from typing import Any
 
+from app.config import settings
 from app.services import prompt
 from app.services.json_utils import (
     clean_dict_list,
@@ -61,6 +62,10 @@ async def parse_job(text: str) -> dict[str, Any]:
     raw = await llm_service.chat(
         [{"role": "system", "content": system_prompt}],
         temperature=_EXTRACT_TEMPERATURE,
+        # ⚠️ 必须显式指定：不传会落到 chat_max_tokens(2000)，
+        #    职责列表 + 技能列表很容易被截断成不合法的 JSON。
+        max_tokens=settings.extract_max_tokens,
+        timeout=settings.extract_timeout_seconds,
     )
 
     structured = _normalize(extract_json_object(raw))

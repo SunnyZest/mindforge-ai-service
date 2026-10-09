@@ -54,6 +54,17 @@ def extract_json_object(text: str) -> dict[str, Any]:
         if obj is not None:
             return obj
 
+    # ★ 花括号不闭合 = 输出被 max_tokens 截断了。
+    #   必须和「模型格式跑偏」分开报：前者该去调大 extract_max_tokens，
+    #   后者该去改提示词。混成一句话会让排查的人去翻提示词，方向全错。
+    opened, closed = cleaned.count("{"), cleaned.count("}")
+    if opened > closed:
+        raise JsonExtractError(
+            f"模型输出被截断了（{opened} 个 '{{' 只闭合了 {closed} 个）——"
+            f"多半是 max_tokens 不够，请调大 extract_max_tokens。"
+            f"原始输出前 200 字：{text.strip()[:200]}"
+        )
+
     raise JsonExtractError(
         f"模型输出里找不到合法 JSON。原始输出前 200 字：{text.strip()[:200]}"
     )

@@ -11,7 +11,9 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# 对话生成比嵌入慢得多（要等模型逐 token 生成），超时给宽一点
+# 对话生成比嵌入慢得多（要等模型逐 token 生成），超时给宽一点。
+# ⚠️ 这是【客户端默认值】。抽取任务要吐几千 token，得单独传更长的超时
+#    （见 settings.extract_timeout_seconds）—— 120 秒对详细简历是不够的。
 _TIMEOUT_SECONDS = 120.0
 
 
@@ -57,6 +59,7 @@ class LlmService:
         *,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        timeout: float | None = None,
     ) -> str:
         """一次对话，返回完整回答。
 
@@ -65,9 +68,13 @@ class LlmService:
             temperature: 温度。**问答场景应该调低** —— 默认 0.3，
                 越低越不容易编造，但太死板。不要用默认的 1.0。
             max_tokens: 回答长度上限
+            timeout: 本次调用的超时（秒）。不传用客户端默认的 120 秒。
+                ⚠️ **抽取类任务必须传更长的值** —— 输出量大，生成时间远超对话。
+                ⚠️ 而且它必须【小于】调用方（Java）的读超时，否则本服务
+                报出来的错误根本没机会传回去，对方只会看到「连接断了」。
 
         Raises:
-            RuntimeError: 调用失败
+            LlmCallError: 调用失败
         """
         if not messages:
             raise ValueError("messages 不能为空")
@@ -80,6 +87,7 @@ class LlmService:
                 messages=messages,
                 temperature=settings.chat_temperature if temperature is None else temperature,
                 max_tokens=max_tokens or settings.chat_max_tokens,
+                timeout=timeout,
             )
         except Exception as exc:                     # noqa: BLE001
             raise LlmCallError(
