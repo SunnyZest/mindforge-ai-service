@@ -43,6 +43,10 @@ class LlmService:
             api_key=settings.dashscope_api_key or _KEY_NOT_CONFIGURED,
             base_url=settings.dashscope_base_url,
             timeout=_TIMEOUT_SECONDS,
+            # ⚠️ 显式配，不吃 SDK 默认值（默认 2）——
+            #    重试次数直接决定「最坏耗时 = 超时 × (1+重试)」，
+            #    而 Java 侧的读超时是按这个最坏耗时定的（见 config.py 里的说明）。
+            max_retries=settings.llm_max_retries,
         )
 
     @staticmethod
