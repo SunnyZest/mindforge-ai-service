@@ -152,7 +152,9 @@ def _normalize_work(value: Any) -> list[dict[str, Any]]:
             "position": clean_str(item.get("position"), max_len=128),
             "startDate": clean_str(item.get("startDate"), max_len=32),
             "endDate": clean_str(item.get("endDate"), max_len=32),
-            "description": clean_str(item.get("description"), max_len=4000),
+            # 提示词里要求「长原文只留关键句、不要整段照抄」，这里 1500 是安全网。
+            # 之前是 4000 —— 模型会把简历原文大段搬回来，输出量翻好几倍。
+            "description": clean_str(item.get("description"), max_len=1500),
         })
     return result
 
@@ -166,7 +168,8 @@ def _normalize_projects(value: Any) -> list[dict[str, Any]]:
         result.append({
             "name": name,
             "role": clean_str(item.get("role"), max_len=128),
-            "description": clean_str(item.get("description"), max_len=4000),
+            # 同 workExperience.description：1500 是安全网，主要靠提示词约束
+            "description": clean_str(item.get("description"), max_len=1500),
             "techStack": clean_str_list(item.get("techStack"), item_max_len=64, limit=30),
         })
     return result
@@ -212,8 +215,11 @@ _ANALYZE_TARGETS = {
     "SKILLS", "EDUCATION", "OVERALL",
 }
 
-# 最多返回几条建议。太多会让用户不知道先改哪个
-_MAX_ANALYZE_ITEMS = 8
+# 最多返回几条建议。太多会让用户不知道先改哪个，
+# ⚠️ 而且它直接决定输出量：每条有 5 个文本字段，8 条实测能写到 5000+ token、
+#    单次调用跑满 300 秒超时。收到 5 条后典型耗时降到几十秒。
+#    （提示词里也写了同样的上限和每字段字数，两边要一起改）
+_MAX_ANALYZE_ITEMS = 5
 
 # 分析时喂给模型的 JD 上限 —— 用不着整篇 JD，岗位要求通常在前 2000 字里
 _MAX_JOB_CHARS = 4000
@@ -297,8 +303,13 @@ def _normalize_analysis(raw: dict[str, Any]) -> dict[str, Any]:
     """
     items: list[dict[str, Any]] = []
     for item in clean_dict_list(raw.get("items"), limit=_MAX_ANALYZE_ITEMS):
-        original = clean_str(item.get("original"), max_len=1000)
-        suggestion = clean_str(item.get("suggestion"), max_len=1000)
+        # ⚠️ 下面这些 max_len 是【安全网】，不是主要控制手段 ——
+        #    主要靠提示词里写的字数上限（original ≤80 / issue ≤60 / suggestion ≤80 /
+        #    rewritten ≤120 / missingFact ≤60）。这里留的余量比提示词宽 3~5 倍，
+        #    正常输出不会被截，只有模型偶尔写飞了才兜一下。
+        #    截断是硬切、不加省略号，所以别把这里调得比提示词还紧。
+        original = clean_str(item.get("original"), max_len=500)
+        suggestion = clean_str(item.get("suggestion"), max_len=400)
         # 原文和建议都拿不到的条目没有意义 —— 用户看不出在说哪一句
         if original is None and suggestion is None:
             continue
@@ -307,15 +318,15 @@ def _normalize_analysis(raw: dict[str, Any]) -> dict[str, Any]:
         items.append({
             "target": clean_enum(item.get("target"), _ANALYZE_TARGETS),
             "original": original,
-            "issue": clean_str(item.get("issue"), max_len=1000),
+            "issue": clean_str(item.get("issue"), max_len=300),
             "suggestion": suggestion,
             # ★ 兜底：要补事实的条目，rewritten 一律置空。
             #   模型有时候「嘴上标了 needsFact，rewritten 里却已经编好了」——
             #   那是编造的内容，绝不能漏到前端去。
             "rewritten": None if needs_fact
-                         else clean_str(item.get("rewritten"), max_len=2000),
+                         else clean_str(item.get("rewritten"), max_len=600),
             "needsFact": needs_fact,
-            "missingFact": clean_str(item.get("missingFact"), max_len=500)
+            "missingFact": clean_str(item.get("missingFact"), max_len=300)
                            if needs_fact else None,
         })
 
