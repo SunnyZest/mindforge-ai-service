@@ -19,7 +19,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.core.security import verify_service_token
-from app.services import chat, interview, job, rag, resume
+from app.services import chat, interview, job, match, rag, resume
 from app.services.downloader import download_bytes
 from app.services.embedding import EmbeddingCallError
 from app.services.llm import LlmCallError
@@ -361,6 +361,46 @@ async def resume_analyze(req: ResumeAnalyzeRequest) -> dict:
     need_fact = sum(1 for i in result["items"] if i["needsFact"])
     logger.info("简历分析：user=%s resume=%s → %d 条建议（%d 条待补事实）",
                 req.userId, req.resumeId, len(result["items"]), need_fact)
+
+    return {"code": 0, "message": "成功", "data": result}
+
+
+# ---------- 简历-JD 匹配 ----------
+
+
+class ResumeMatchRequest(BaseModel):
+    """简历-JD 匹配请求。
+
+    ⚠️ 和 resumes/analyze 一样传【文本】而不是 id：本服务不连数据库（数据访问全在 Java），
+    Java 把已经存好的 resume.raw_content / job.raw_content 带过来就行。
+    """
+
+    userId: str = Field(description="调用方已确认的用户 id（本服务只用于日志，不校验权限）")
+    resumeId: str = Field(description="简历 id（仅用于日志）")
+    jobId: str = Field(description="职位 id（仅用于日志）")
+    resumeText: str = Field(min_length=1, description="简历原文")
+    jobText: str = Field(min_length=1, description="目标岗位 JD 原文")
+
+
+@router.post("/resumes/match", summary="简历与职位匹配分析（五类结论）")
+async def resume_match(req: ResumeMatchRequest) -> dict:
+    """逐条对照 JD 给出匹配结论。
+
+    ★ 每条要求落到五类之一：已匹配 / 表达缺口 / 证据不足 / 真实缺口 / 待确认。
+    `overallScore` 只作展示辅助，**不参与任何准入判断** ——
+    百分比没法行动，五类才能直接告诉用户该改哪一句、补哪件事。
+
+    ⚠️ 和 /resumes/analyze 的区别：那个是「这份简历自己怎么写得更好」（不需要参照物），
+    这个是「对【这个岗位】够不够」（必须有 JD 才成立）。两者不能互相替代。
+    """
+    result = await match.match_resume(req.resumeText, req.jobText)
+
+    counts: dict[str, int] = {}
+    for item in result["items"]:
+        counts[item["verdict"]] = counts.get(item["verdict"], 0) + 1
+
+    logger.info("简历匹配：user=%s resume=%s job=%s → %d 条要求 %s",
+                req.userId, req.resumeId, req.jobId, len(result["items"]), counts)
 
     return {"code": 0, "message": "成功", "data": result}
 
