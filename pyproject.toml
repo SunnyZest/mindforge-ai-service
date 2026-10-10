@@ -29,6 +29,7 @@ default = true
 
 [dependency-groups]
 dev = [
+    "pytest==8.3.5",
     "reportlab>=5.0.1",
 ]
 
@@ -38,3 +39,14 @@ dev = [
 # · 依赖用 `uv add xxx` 添加，会自动写进上面的 dependencies。
 # · 原来 uv init 生成的 [project.scripts] 指向 `mindforge_ai_service:main`，
 #   那个函数不存在，留着会让 uv sync 在生成入口点时出问题，所以删掉了。
+
+[tool.pytest.ini_options]
+# 让 `import app.xxx` 能直接用（pytest 7+ 的 pythonpath 选项）
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "e2e: 真实链路端到端测试。需要四个服务都在跑，会真调大模型、烧 token、跑十几分钟，默认不跑。",
+]
+# 默认跳过 e2e：日常改代码只要几秒钟的反馈，不想每次都等十几分钟、还花钱。
+# 要跑真实链路时显式指定：pytest -m e2e
+addopts = "-m 'not e2e'"
