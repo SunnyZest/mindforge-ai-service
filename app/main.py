@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from app.api import health, internal
 from app.clients.java_client import java_client
 from app.config import PROJECT_ROOT, settings
+from app.services import ai_config
 from app.services.embedding import EmbeddingCallError
 from app.services.json_utils import JsonExtractError
 from app.services.llm import LlmCallError
@@ -59,6 +60,28 @@ async def _probe_java() -> None:
         logger.error("   请检查：① Java 是否已启动  ② JAVA_SERVICE_TOKEN 是否与 Java 一致")
 
 
+async def _warm_up_ai_config() -> None:
+    """启动时先拉一次 AI 模型配置并打日志。
+
+    目的是让「现在用的到底是哪套模型」在启动横幅里一眼可见 ——
+    「管理端改了配置没生效」这个问题，第一件事就是看这里。
+
+    拉不到不算错（Java 可能还没起），后台协程会继续重试。
+    """
+    try:
+        count = await ai_config.refresh_once()
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("   首次拉取 AI 模型配置失败（不影响启动）：%s", exc)
+        count = 0
+
+    if count:
+        logger.info("   AI 模型配置 : %s（来自管理端）", ai_config.describe())
+    else:
+        logger.info("   AI 模型配置 : 管理端没配，全部回退 .env"
+                    "（chat=%s, embedding=%s）",
+                    settings.chat_model, settings.embedding_model)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     logger.info("MindForge AI Service 启动中…")
@@ -74,10 +97,17 @@ async def lifespan(_: FastAPI):
                      "请检查 %s 是否存在且已填。",
                      PROJECT_ROOT / ".env")
     if not settings.dashscope_api_key:
-        logger.error("DASHSCOPE_API_KEY 没配置！文档向量化和问答都会失败。")
+        # ⚠️ 只是警告不是错误：管理端可能配了 AI 模型，那就用管理端的。
+        #    真正的「有没有 Key 可用」由 ai_config.get() 判断。
+        logger.warning("DASHSCOPE_API_KEY 没配置 —— 如果管理端「AI 模型配置」里也没配，"
+                       "文档向量化和问答都会失败。")
 
     # 启动时探测一次 Java（只打日志，不阻塞启动 —— Java 没起也不能把本服务卡死）
     probe_task = asyncio.create_task(_probe_java())
+
+    # AI 模型配置：先拉一次打日志，之后由后台协程每 60 秒刷新
+    config_warmup_task = asyncio.create_task(_warm_up_ai_config())
+    config_task = asyncio.create_task(ai_config.refresh_loop())
 
     # 轮询循环：本服务主动去 Java 领任务
     poller_task: asyncio.Task | None = None
@@ -90,11 +120,16 @@ async def lifespan(_: FastAPI):
 
     logger.info("MindForge AI Service 关闭中…")
     probe_task.cancel()
+    config_warmup_task.cancel()
+    config_task.cancel()
     if poller_task is not None:
         poller_task.cancel()
         # 等它真正退出，再关 httpx 连接池 —— 否则可能在半路被抽掉 client
         with suppress(asyncio.CancelledError):
             await poller_task
+    for task in (probe_task, config_warmup_task, config_task):
+        with suppress(asyncio.CancelledError):
+            await task
     await java_client.aclose()
 
 

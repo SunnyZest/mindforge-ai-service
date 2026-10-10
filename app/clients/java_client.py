@@ -148,6 +148,22 @@ class JavaClient:
         )
         self._raise_for_status(resp, "标记向量已清除")
 
+    # ---------- ③ AI 模型配置 ----------
+
+    async def list_ai_models(self) -> list[dict]:
+        """拉取 Java 下发的 AI 模型配置（API Key 已解密）。
+
+        管理端维护的 sys_ai_model 是配置的 owner，本服务只是消费方 ——
+        由后台协程定期调用，见 app/services/ai_config.py。
+
+        返回空列表表示管理端一条都没配（正常情况）——
+        这时 ai_config 会整体回退到环境变量。
+        """
+        resp = await self._client.get(self._url("/internal/ai-models"))
+        self._raise_for_status(resp, "拉取 AI 模型配置")
+        body = resp.json()
+        return body.get("data") or []
+
     # ---------- 生命周期 ----------
 
     async def aclose(self) -> None:

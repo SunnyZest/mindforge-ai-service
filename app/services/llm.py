@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from openai import AsyncOpenAI
 
 from app.config import settings
+from app.services import ai_config
 
 logger = logging.getLogger(__name__)
 
@@ -39,24 +40,62 @@ class LlmService:
     """对话模型。"""
 
     def __init__(self) -> None:
-        self._client = AsyncOpenAI(
-            api_key=settings.dashscope_api_key or _KEY_NOT_CONFIGURED,
-            base_url=settings.dashscope_base_url,
-            timeout=_TIMEOUT_SECONDS,
-            # ⚠️ 显式配，不吃 SDK 默认值（默认 2）——
-            #    重试次数直接决定「最坏耗时 = 超时 × (1+重试)」，
-            #    而 Java 侧的读超时是按这个最坏耗时定的（见 config.py 里的说明）。
-            max_retries=settings.llm_max_retries,
-        )
+        # ⚠️ 懒建 client —— api_key / base_url / 模型名都可能来自管理端配置，
+        #    而那份配置每 60 秒会刷新一次（见 app/services/ai_config.py）。
+        #    在 __init__ 里固化下来，改了配置就得重启服务。
+        self._openai: AsyncOpenAI | None = None
+        self._openai_key: tuple[str, str] | None = None
+
+    def _client(self) -> AsyncOpenAI:
+        """按【当前】配置拿 client；配置变了就重建。
+
+        ⚠️ 重建而不是改属性：连接池是绑在 base_url 上的，
+           改属性不会让已有连接换目标。
+        """
+        config = ai_config.get(ai_config.SCENE_CHAT)
+        key = (config.api_key, config.base_url)
+        if self._openai is None or self._openai_key != key:
+            self._openai = AsyncOpenAI(
+                api_key=config.api_key or _KEY_NOT_CONFIGURED,
+                base_url=config.base_url,
+                timeout=_TIMEOUT_SECONDS,
+                # ⚠️ 显式配，不吃 SDK 默认值（默认 2）——
+                #    重试次数直接决定「最坏耗时 = 超时 × (1+重试)」，
+                #    而 Java 侧的读超时是按这个最坏耗时定的（见 config.py 里的说明）。
+                max_retries=settings.llm_max_retries,
+            )
+            self._openai_key = key
+        return self._openai
 
     @staticmethod
     def _ensure_configured() -> None:
-        if not settings.dashscope_api_key:
+        if not ai_config.get(ai_config.SCENE_CHAT).api_key:
             raise LlmCallError(
-                "DASHSCOPE_API_KEY 未配置，无法调用对话模型。"
-                "请在项目根目录的 .env 里填写（注意：本项目用 DashScope 的 "
-                "OpenAI 兼容接口，配的是 DASHSCOPE_API_KEY，不是 OPENAI_API_KEY）"
+                "没有可用的对话模型 API Key。请检查两处："
+                "① 管理端「AI 模型配置」里有没有配 CHAT 场景；"
+                "② 项目根目录 .env 里的 DASHSCOPE_API_KEY"
+                "（本项目用 DashScope 的 OpenAI 兼容接口，配的是 DASHSCOPE_API_KEY，"
+                "不是 OPENAI_API_KEY）"
             )
+
+    @staticmethod
+    def _resolve(
+        config: "ai_config.ModelConfig",
+        temperature: float | None,
+        max_tokens: int | None,
+    ) -> tuple[float, int]:
+        """把「调用方显式传的」和「配置里的默认值」合成最终参数。
+
+        ⚠️ 三级回退：调用方入参 > 生效配置 > 代码里的默认值。
+           配置来自管理端时 temperature/max_tokens 可能是空的，所以最后一级不能省。
+        """
+        final_temperature = (
+            temperature
+            if temperature is not None
+            else (config.temperature if config.temperature is not None else settings.chat_temperature)
+        )
+        final_max_tokens = max_tokens or config.max_tokens or settings.chat_max_tokens
+        return final_temperature, final_max_tokens
 
     async def chat(
         self,
@@ -86,12 +125,15 @@ class LlmService:
 
         self._ensure_configured()
 
+        config = ai_config.get(ai_config.SCENE_CHAT)
+        final_temperature, final_max_tokens = self._resolve(config, temperature, max_tokens)
+
         try:
-            resp = await self._client.chat.completions.create(
-                model=settings.chat_model,
+            resp = await self._client().chat.completions.create(
+                model=config.model,
                 messages=messages,
-                temperature=settings.chat_temperature if temperature is None else temperature,
-                max_tokens=max_tokens or settings.chat_max_tokens,
+                temperature=final_temperature,
+                max_tokens=final_max_tokens,
                 timeout=timeout,
             )
         except Exception as exc:                     # noqa: BLE001
@@ -145,12 +187,15 @@ class LlmService:
 
         self._ensure_configured()
 
+        config = ai_config.get(ai_config.SCENE_CHAT)
+        final_temperature, final_max_tokens = self._resolve(config, temperature, max_tokens)
+
         try:
-            stream = await self._client.chat.completions.create(
-                model=settings.chat_model,
+            stream = await self._client().chat.completions.create(
+                model=config.model,
                 messages=messages,
-                temperature=settings.chat_temperature if temperature is None else temperature,
-                max_tokens=max_tokens or settings.chat_max_tokens,
+                temperature=final_temperature,
+                max_tokens=final_max_tokens,
                 timeout=timeout,
                 stream=True,
             )
@@ -176,7 +221,9 @@ class LlmService:
             ) from exc
 
     async def aclose(self) -> None:
-        await self._client.close()
+        # client 是懒建的，可能压根没建过
+        if self._openai is not None:
+            await self._openai.close()
 
 
 # 模块级单例

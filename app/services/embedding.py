@@ -13,6 +13,7 @@ import logging
 from openai import AsyncOpenAI
 
 from app.config import settings
+from app.services import ai_config
 
 logger = logging.getLogger(__name__)
 
@@ -52,20 +53,34 @@ class EmbeddingService:
     """文本 → 向量。"""
 
     def __init__(self) -> None:
-        self._client = AsyncOpenAI(
-            api_key=settings.dashscope_api_key or _KEY_NOT_CONFIGURED,
-            base_url=settings.dashscope_base_url,
-            timeout=_TIMEOUT_SECONDS,
-        )
+        # ⚠️ 懒建 client —— 理由同 llm.py：api_key / base_url / 模型名可能来自
+        #    管理端配置，而那份配置每 60 秒刷新一次（见 app/services/ai_config.py）。
+        self._openai: AsyncOpenAI | None = None
+        self._openai_key: tuple[str, str] | None = None
+
+    def _client(self) -> AsyncOpenAI:
+        """按【当前】配置拿 client；配置变了就重建。"""
+        config = ai_config.get(ai_config.SCENE_EMBEDDING)
+        key = (config.api_key, config.base_url)
+        if self._openai is None or self._openai_key != key:
+            self._openai = AsyncOpenAI(
+                api_key=config.api_key or _KEY_NOT_CONFIGURED,
+                base_url=config.base_url,
+                timeout=_TIMEOUT_SECONDS,
+            )
+            self._openai_key = key
+        return self._openai
 
     @staticmethod
     def _ensure_configured() -> None:
         """调用前检查 key —— 报错要说清是哪个配置项，别让人去猜。"""
-        if not settings.dashscope_api_key:
+        if not ai_config.get(ai_config.SCENE_EMBEDDING).api_key:
             raise EmbeddingCallError(
-                "DASHSCOPE_API_KEY 未配置，无法调用嵌入模型。"
-                "请在项目根目录的 .env 里填写（注意：本项目用 DashScope 的 "
-                "OpenAI 兼容接口，配的是 DASHSCOPE_API_KEY，不是 OPENAI_API_KEY）"
+                "没有可用的嵌入模型 API Key。请检查两处："
+                "① 管理端「AI 模型配置」里有没有配 EMBEDDING 场景；"
+                "② 项目根目录 .env 里的 DASHSCOPE_API_KEY"
+                "（本项目用 DashScope 的 OpenAI 兼容接口，配的是 DASHSCOPE_API_KEY，"
+                "不是 OPENAI_API_KEY）"
             )
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
@@ -95,8 +110,8 @@ class EmbeddingService:
             # 一次处理的条数(长度)
             batch = cleaned[start:start + batch_size]
             try:
-                resp = await self._client.embeddings.create(
-                    model=settings.embedding_model,
+                resp = await self._client().embeddings.create(
+                    model=ai_config.get(ai_config.SCENE_EMBEDDING).model,
                     input=batch,
                 )
             except Exception as exc:                    # noqa: BLE001
@@ -123,7 +138,9 @@ class EmbeddingService:
         return result[0]
 
     async def aclose(self) -> None:
-        await self._client.close()
+        # client 是懒建的，可能压根没建过
+        if self._openai is not None:
+            await self._openai.close()
 
 
 # 模块级单例
