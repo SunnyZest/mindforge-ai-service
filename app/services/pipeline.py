@@ -11,6 +11,7 @@
 
 import logging
 
+from app.services import ai_usage
 from app.clients.java_client import java_client
 from app.config import settings
 from app.services.downloader import download_bytes
@@ -81,7 +82,7 @@ async def process_document(task: dict) -> bool:
         #    检索时靠它过滤。Java 的 claim 响应里带了这个字段，必须原样传下去。
         vector_ids: list[str] | None = None
         try:
-            embeddings = await embedding_service.embed(pieces)
+            embeddings = await embedding_service.embed(pieces, scene=ai_usage.SCENE_EMBEDDING)
             vector_ids = await vector_store.add(
                 document_id=document_id,
                 knowledge_base_id=task["knowledgeBaseId"],

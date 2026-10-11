@@ -10,7 +10,7 @@ import logging
 from collections.abc import AsyncIterator
 
 from app.config import settings
-from app.services import prompt, rag
+from app.services import prompt, rag, ai_usage
 from app.services.llm import LlmCallError, llm_service
 
 logger = logging.getLogger(__name__)
@@ -33,6 +33,7 @@ async def chat(
     query: str,
     top_k: int | None = None,
     history: list[dict] | None = None,
+    prompt_id: str | None = None,
 ) -> dict:
     """基于知识库回答问题。
 
@@ -42,6 +43,7 @@ async def chat(
         top_k: 检索片段数
         history: 历史消息 [{role, content}, ...]，最多取最近 N 轮。
                  Java 侧从 chat_message 表取，不传就是单轮问答。
+        prompt_id: 回答风格 id（用户在界面上选的）。不传用默认风格。
 
     Returns:
         {
@@ -84,10 +86,10 @@ async def chat(
         }
 
     # ---------- ② 拼 prompt ----------
-    messages, truncated = _build_messages(sources, query, history)
+    messages, truncated = _build_messages(sources, query, history, prompt_id)
 
     # ---------- ③ 调模型 ----------
-    answer = await llm_service.chat(messages)
+    answer = await llm_service.chat(messages, scene=ai_usage.SCENE_RAG_CHAT)
 
     # 模型按 prompt 的约定，在资料答不了时会回答那句固定话术。
     # 靠这个判断「有没有实质回答」—— 比让模型额外输出 JSON 更省 token，
@@ -113,6 +115,7 @@ async def chat_stream(
     query: str,
     top_k: int | None = None,
     history: list[dict] | None = None,
+    prompt_id: str | None = None,
 ) -> AsyncIterator[dict]:
     """流式版 `chat()` —— 逐段吐事件，而不是攒完一次性返回。
 
@@ -169,7 +172,7 @@ async def chat_stream(
         yield {"type": "done", "answer": _NO_RESULT_ANSWER, "hasAnswer": False}
         return
 
-    messages, truncated = _build_messages(sources, query, history)
+    messages, truncated = _build_messages(sources, query, history, prompt_id)
 
     yield {
         "type": "sources",
@@ -181,7 +184,7 @@ async def chat_stream(
     # ---------- ② 边收边吐 ----------
     # ⚠️ 必须自己把增量拼起来：hasAnswer 要拿完整回答才能判断
     pieces: list[str] = []
-    async for piece in llm_service.chat_stream(messages):
+    async for piece in llm_service.chat_stream(messages, scene=ai_usage.SCENE_RAG_CHAT):
         pieces.append(piece)
         yield {"type": "delta", "text": piece}
 
@@ -221,11 +224,18 @@ def _build_messages(
     sources: list[dict],
     query: str,
     history: list[dict] | None,
+    prompt_id: str | None = None,
 ) -> tuple[list[dict], bool]:
-    """把检索结果拼成 messages。返回 (messages, 参考资料是否被截断)。"""
+    """把检索结果拼成 messages。返回 (messages, 参考资料是否被截断)。
+
+    Args:
+        prompt_id: 回答风格（管理端配的版本行 id）。
+            不传 / 找不到 / 没开放给用户切换时，prompt_store 会回退默认那条；
+            管理端一条都没配时，最终回退到 prompts/rag_chat.txt。
+    """
     context, truncated = _build_context(sources)
-    # 提示词在 prompts/rag_chat.txt —— 改文案不用动代码
-    system_prompt = prompt.render("rag_chat", context=context)
+    # 提示词优先用管理端配的（见 prompt_store），没配就回退 prompts/rag_chat.txt
+    system_prompt = prompt.render("rag_chat", prompt_id=prompt_id, context=context)
 
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
     messages.extend(_trim_history(history))

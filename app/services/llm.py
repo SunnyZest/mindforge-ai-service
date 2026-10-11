@@ -4,12 +4,13 @@
 """
 
 import logging
+import time
 from collections.abc import AsyncIterator
 
 from openai import AsyncOpenAI
 
 from app.config import settings
-from app.services import ai_config
+from app.services import ai_config, ai_usage
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,8 @@ class LlmService:
         temperature: float | None = None,
         max_tokens: int | None = None,
         timeout: float | None = None,
+        scene: str = ai_usage.SCENE_UNKNOWN,
+        user_id: str | int | None = None,
     ) -> str:
         """一次对话，返回完整回答。
 
@@ -116,6 +119,8 @@ class LlmService:
                 ⚠️ **抽取类任务必须传更长的值** —— 输出量大，生成时间远超对话。
                 ⚠️ 而且它必须【小于】调用方（Java）的读超时，否则本服务
                 报出来的错误根本没机会传回去，对方只会看到「连接断了」。
+            scene: 业务场景（{@code ai_usage.SCENE_*}），只用于 AI 使用量统计。
+            user_id: 触发用户，只用于 AI 使用量统计。
 
         Raises:
             LlmCallError: 调用失败
@@ -127,6 +132,7 @@ class LlmService:
 
         config = ai_config.get(ai_config.SCENE_CHAT)
         final_temperature, final_max_tokens = self._resolve(config, temperature, max_tokens)
+        started = time.monotonic()
 
         try:
             resp = await self._client().chat.completions.create(
@@ -137,11 +143,15 @@ class LlmService:
                 timeout=timeout,
             )
         except Exception as exc:                     # noqa: BLE001
+            _report(scene, user_id, config, started, status=ai_usage.FAILED,
+                    error=f"{type(exc).__name__}: {exc}")
             raise LlmCallError(
                 f"对话模型调用失败：{type(exc).__name__}: {exc}"
             ) from exc
 
         if not resp.choices:
+            _report(scene, user_id, config, started, status=ai_usage.FAILED,
+                    error="模型返回了空结果")
             raise LlmCallError("对话模型返回了空结果")
 
         answer = (resp.choices[0].message.content or "").strip()
@@ -151,6 +161,7 @@ class LlmService:
                         resp.usage.prompt_tokens or 0,
                         resp.usage.completion_tokens or 0)
 
+        _report(scene, user_id, config, started, usage=resp.usage)
         return answer
 
     async def chat_stream(
@@ -160,6 +171,8 @@ class LlmService:
         temperature: float | None = None,
         max_tokens: int | None = None,
         timeout: float | None = None,
+        scene: str = ai_usage.SCENE_UNKNOWN,
+        user_id: str | int | None = None,
     ) -> AsyncIterator[str]:
         """流式对话 —— 逐段吐出增量文本。
 
@@ -189,24 +202,17 @@ class LlmService:
 
         config = ai_config.get(ai_config.SCENE_CHAT)
         final_temperature, final_max_tokens = self._resolve(config, temperature, max_tokens)
+        started = time.monotonic()
 
-        try:
-            stream = await self._client().chat.completions.create(
-                model=config.model,
-                messages=messages,
-                temperature=final_temperature,
-                max_tokens=final_max_tokens,
-                timeout=timeout,
-                stream=True,
-            )
-        except Exception as exc:                     # noqa: BLE001
-            # 连流都没建起来（鉴权 / 网络 / 限流）—— 这时还没吐过任何东西
-            raise LlmCallError(
-                f"对话模型调用失败：{type(exc).__name__}: {exc}"
-            ) from exc
+        stream = await self._open_stream(config, messages, final_temperature, final_max_tokens,
+                                         timeout, scene, user_id, started)
 
+        usage = None
         try:
             async for chunk in stream:
+                # 流式的 usage 只在最后一个 chunk 上（要显式开 stream_options 才有）
+                if getattr(chunk, "usage", None):
+                    usage = chunk.usage
                 # 有些 chunk 只带 usage、没有 choices（末尾那一个），要跳过
                 if not chunk.choices:
                     continue
@@ -214,16 +220,82 @@ class LlmService:
                 if text:
                     yield text
         except Exception as exc:                     # noqa: BLE001
+            _report(scene, user_id, config, started, status=ai_usage.FAILED,
+                    error=f"流式中断 {type(exc).__name__}: {exc}")
             # ⚠️ 中途断了 —— 前面已经吐出去的内容收不回来，
             #    调用方只能把这条错误追加到流末尾，让前端知道「后面没了」。
             raise LlmCallError(
                 f"流式对话中断：{type(exc).__name__}: {exc}"
             ) from exc
 
+        _report(scene, user_id, config, started, usage=usage)
+
+    async def _open_stream(self, config: "ai_config.ModelConfig", messages: list[dict],
+                           temperature: float, max_tokens: int, timeout: float | None,
+                           scene: str, user_id: str | int | None,
+                           started: float) -> AsyncIterator[object]:
+        """建流。
+
+        ⚠️ 先带 {@code stream_options} 试一次 —— 它能让我们拿到流式的 token 用量，
+           但那是 OpenAI 协议的扩展，不是每个提供方都认。
+           不认就退回去不带重试：**记账是附加功能，不能因为它把流式对话搞挂**。
+        """
+
+        async def create(include_usage: bool):
+            extra = {"stream_options": {"include_usage": True}} if include_usage else {}
+            return await self._client().chat.completions.create(
+                model=config.model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                stream=True,
+                **extra,
+            )
+
+        try:
+            return await create(True)
+        except Exception as exc:                     # noqa: BLE001
+            if "stream_options" not in str(exc):
+                _report(scene, user_id, config, started, status=ai_usage.FAILED,
+                        error=f"{type(exc).__name__}: {exc}")
+                raise LlmCallError(
+                    f"对话模型调用失败：{type(exc).__name__}: {exc}"
+                ) from exc
+            logger.warning("这个模型不支持 stream_options，本次流式拿不到 token 用量：%s", exc)
+
+        try:
+            return await create(False)
+        except Exception as exc:                     # noqa: BLE001
+            _report(scene, user_id, config, started, status=ai_usage.FAILED,
+                    error=f"{type(exc).__name__}: {exc}")
+            raise LlmCallError(
+                f"对话模型调用失败：{type(exc).__name__}: {exc}"
+            ) from exc
+
     async def aclose(self) -> None:
         # client 是懒建的，可能压根没建过
         if self._openai is not None:
             await self._openai.close()
+
+
+def _report(scene: str, user_id: str | int | None, config: "ai_config.ModelConfig",
+            started: float, *, usage: object = None,
+            status: str = ai_usage.SUCCESS, error: str | None = None) -> None:
+    """记一次账。同步函数，内部异步发出去，不阻塞调用方。
+
+    ⚠️ 它自己不会抛异常（见 ai_usage.record）—— 记账失败不能影响 AI 调用。
+    """
+    ai_usage.record(
+        scene=scene,
+        user_id=user_id,
+        provider=config.provider,
+        model=config.model,
+        usage=usage,
+        duration_ms=int((time.monotonic() - started) * 1000),
+        status=status,
+        error_message=error,
+    )
 
 
 # 模块级单例

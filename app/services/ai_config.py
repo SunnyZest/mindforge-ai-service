@@ -45,6 +45,8 @@ class ModelConfig:
     api_key: str
     base_url: str
     model: str
+    # 提供方，只用于 AI 使用量统计（ai_usage_record.provider）
+    provider: str = "dashscope"
     temperature: float | None = None
     max_tokens: int | None = None
     timeout_seconds: int | None = None
@@ -132,6 +134,7 @@ def _from_java(raw: dict) -> ModelConfig | None:
         api_key=(raw.get("apiKey") or "").strip(),
         base_url=(raw.get("baseUrl") or settings.dashscope_base_url).strip(),
         model=model,
+        provider=(raw.get("provider") or "dashscope").strip(),
         temperature=raw.get("temperature"),
         max_tokens=raw.get("maxTokens"),
         timeout_seconds=raw.get("timeoutSeconds"),

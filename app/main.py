@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse
 from app.api import health, internal
 from app.clients.java_client import java_client
 from app.config import PROJECT_ROOT, settings
-from app.services import ai_config
+from app.services import ai_config, ai_usage, prompt_store
 from app.services.embedding import EmbeddingCallError
 from app.services.json_utils import JsonExtractError
 from app.services.llm import LlmCallError
@@ -60,26 +60,37 @@ async def _probe_java() -> None:
         logger.error("   请检查：① Java 是否已启动  ② JAVA_SERVICE_TOKEN 是否与 Java 一致")
 
 
-async def _warm_up_ai_config() -> None:
-    """启动时先拉一次 AI 模型配置并打日志。
+async def _warm_up_remote_config() -> None:
+    """启动时先拉一次 AI 模型配置和提示词，并打日志。
 
-    目的是让「现在用的到底是哪套模型」在启动横幅里一眼可见 ——
+    目的是让「现在用的到底是哪套模型、哪套提示词」在启动横幅里一眼可见 ——
     「管理端改了配置没生效」这个问题，第一件事就是看这里。
 
     拉不到不算错（Java 可能还没起），后台协程会继续重试。
     """
     try:
-        count = await ai_config.refresh_once()
+        model_count = await ai_config.refresh_once()
     except Exception as exc:                            # noqa: BLE001
         logger.warning("   首次拉取 AI 模型配置失败（不影响启动）：%s", exc)
-        count = 0
+        model_count = 0
 
-    if count:
+    if model_count:
         logger.info("   AI 模型配置 : %s（来自管理端）", ai_config.describe())
     else:
         logger.info("   AI 模型配置 : 管理端没配，全部回退 .env"
                     "（chat=%s, embedding=%s）",
                     settings.chat_model, settings.embedding_model)
+
+    try:
+        prompt_count = await prompt_store.refresh_once()
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("   首次拉取提示词失败（不影响启动）：%s", exc)
+        prompt_count = 0
+
+    if prompt_count:
+        logger.info("   提示词配置   : %s（来自管理端）", prompt_store.describe())
+    else:
+        logger.info("   提示词配置   : 管理端没配，全部回退 prompts/*.txt")
 
 
 @asynccontextmanager
@@ -105,9 +116,10 @@ async def lifespan(_: FastAPI):
     # 启动时探测一次 Java（只打日志，不阻塞启动 —— Java 没起也不能把本服务卡死）
     probe_task = asyncio.create_task(_probe_java())
 
-    # AI 模型配置：先拉一次打日志，之后由后台协程每 60 秒刷新
-    config_warmup_task = asyncio.create_task(_warm_up_ai_config())
+    # 远端配置（AI 模型 + 提示词）：先拉一次打日志，之后由后台协程每 60 秒刷新
+    config_warmup_task = asyncio.create_task(_warm_up_remote_config())
     config_task = asyncio.create_task(ai_config.refresh_loop())
+    prompt_task = asyncio.create_task(prompt_store.refresh_loop())
 
     # 轮询循环：本服务主动去 Java 领任务
     poller_task: asyncio.Task | None = None
@@ -122,14 +134,20 @@ async def lifespan(_: FastAPI):
     probe_task.cancel()
     config_warmup_task.cancel()
     config_task.cancel()
+    prompt_task.cancel()
     if poller_task is not None:
         poller_task.cancel()
         # 等它真正退出，再关 httpx 连接池 —— 否则可能在半路被抽掉 client
         with suppress(asyncio.CancelledError):
             await poller_task
-    for task in (probe_task, config_warmup_task, config_task):
+    for task in (probe_task, config_warmup_task, config_task, prompt_task):
         with suppress(asyncio.CancelledError):
             await task
+
+    # ⚠️ 必须【在关连接池之前】把在飞的 AI 使用量上报发完 ——
+    #    上报是 fire-and-forget 的，不等的话最后几条账会丢。
+    await ai_usage.drain()
+
     await java_client.aclose()
 
 
@@ -142,6 +160,37 @@ app = FastAPI(
 
 app.include_router(health.router)
 app.include_router(internal.router)
+
+
+class RequestContextMiddleware:
+    """把 Java 传过来的 traceId / userId 接住，供 AI 使用量记账使用。
+
+    ⚠️ 用【纯 ASGI 中间件】而不是 {@code @app.middleware("http")}
+       （后者基于 Starlette 的 BaseHTTPMiddleware）—— BaseHTTPMiddleware 会把下游
+       放进另一个 task 里跑，contextvar 不一定传得下去。纯 ASGI 中间件是直接
+       {@code await self.app(...)}，和路由处理函数在同一个 task 上下文里，
+       这里 set 的 contextvar 处理函数一定看得到。
+
+    ⚠️ 必须在【进入】下游之前 set —— 处理函数一开始跑就可能在调模型了。
+    """
+
+    def __init__(self, asgi_app) -> None:
+        self._app = asgi_app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") == "http":
+            headers = {k.lower(): v for k, v in (scope.get("headers") or [])}
+            ai_usage.set_trace_id(_header(headers, b"x-trace-id"))
+            ai_usage.set_user_id(_header(headers, b"x-user-id"))
+        await self._app(scope, receive, send)
+
+
+def _header(headers: dict[bytes, bytes], name: bytes) -> str:
+    value = headers.get(name)
+    return value.decode("latin-1") if value else ""
+
+
+app.add_middleware(RequestContextMiddleware)
 
 
 # ---------- 统一响应格式 ----------

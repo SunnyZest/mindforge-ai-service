@@ -92,3 +92,73 @@ def test_none_value_renders_as_empty_string():
 
     assert "None" not in rendered
     assert not PLACEHOLDER.findall(rendered)
+
+
+# ---------- 管理端配置的那条优先于文件 ----------
+
+@pytest.fixture(autouse=True)
+def no_remote_prompts(monkeypatch):
+    """默认让 prompt_store 空着 —— 这样上面那些用例测的还是文件版。
+
+    ⚠️ 不隔离的话，test_prompt_store 留下的缓存会让这里的用例行为变得依赖执行顺序。
+    """
+    from app.services import prompt_store
+    monkeypatch.setattr(prompt_store, "_by_id", {})
+    monkeypatch.setattr(prompt_store, "_by_scene", {})
+    yield
+    prompt_store._by_id = {}
+    prompt_store._by_scene = {}
+
+
+def _stub_remote(monkeypatch, content: str, *, version: int = 3):
+    """让 prompt_store.find 返回一条管理端配置。"""
+    from app.services import prompt_store
+
+    entry = prompt_store.PromptEntry(
+        id="42", scene="RAG_CHAT", name="严谨", version=version,
+        label="严谨", is_default=True, user_selectable=True, content=content)
+    monkeypatch.setattr(prompt_store, "find", lambda scene, prompt_id=None: entry)
+    return entry
+
+
+def test_render_uses_remote_prompt_when_configured(monkeypatch):
+    """★ 管理端配了就用管理端的 —— 这正是「配了要生效」这条要求的落点。"""
+    _stub_remote(monkeypatch, "这是管理端配的模板，资料：{context}")
+
+    rendered = prompt.render("rag_chat", context="【片段】")
+
+    assert rendered == "这是管理端配的模板，资料：【片段】"
+
+
+def test_render_falls_back_to_file_when_not_configured():
+    """管理端没配 → 回退 prompts/rag_chat.txt（行为跟以前完全一样）。"""
+    from app.services import prompt
+
+    file_content = prompt.load("rag_chat")
+    rendered = prompt.render("rag_chat", context="【片段】")
+
+    assert "【片段】" in rendered
+    # 文件版里有那句「没找到相关内容」的话术（chat.py 靠它判断 hasAnswer）
+    assert "提供的资料中没有找到相关内容" in file_content
+
+
+def test_remote_prompt_with_bad_placeholders_raises(monkeypatch):
+    """★ 管理端配的模板占位符对不上时要【报错】，不能静默回退文件版 ——
+    静默回退会让管理员以为「改了、生效了」，实际跑的还是旧文件。"""
+    _stub_remote(monkeypatch, "模板里有个填不上的占位符 {unknown_var}")
+
+    with pytest.raises(prompt.PromptRenderError) as excinfo:
+        prompt.render("rag_chat", context="【片段】")
+
+    message = str(excinfo.value)
+    assert "unknown_var" in message
+    assert "管理端配置" in message, "报错要指出问题出在管理端配的那一版，而不是文件版"
+    assert "v3" in message
+
+
+def test_render_error_points_at_file_source_when_no_remote(monkeypatch):
+    """没配时走文件版，报错里也要说清来源是文件。"""
+    with pytest.raises(prompt.PromptRenderError) as excinfo:
+        prompt.render("rag_chat")          # 故意不传 context
+
+    assert "prompts/rag_chat.txt" in str(excinfo.value)

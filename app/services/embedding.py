@@ -9,11 +9,12 @@
 
 import asyncio
 import logging
+import time
 
 from openai import AsyncOpenAI
 
 from app.config import settings
-from app.services import ai_config
+from app.services import ai_config, ai_usage
 
 logger = logging.getLogger(__name__)
 
@@ -83,11 +84,15 @@ class EmbeddingService:
                 "不是 OPENAI_API_KEY）"
             )
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
+    async def embed(self, texts: list[str], *,
+                    scene: str = ai_usage.SCENE_EMBEDDING,
+                    user_id: str | int | None = None) -> list[list[float]]:
         """批量嵌入，自动按 API 上限分批。
 
         Args:
             texts: 待嵌入的文本列表
+            scene: 业务场景，只用于 AI 使用量统计
+            user_id: 触发用户，只用于 AI 使用量统计
 
         Returns:
             和输入顺序、长度一一对应的向量列表
@@ -104,21 +109,28 @@ class EmbeddingService:
         cleaned = [t if (t and t.strip()) else _EMPTY_PLACEHOLDER for t in texts]
 
         batch_size = max(1, settings.embedding_batch_size)
+        config = ai_config.get(ai_config.SCENE_EMBEDDING)
         vectors: list[list[float]] = []
 
         for start in range(0, len(cleaned), batch_size):
             # 一次处理的条数(长度)
             batch = cleaned[start:start + batch_size]
+            started = time.monotonic()
             try:
                 resp = await self._client().embeddings.create(
-                    model=ai_config.get(ai_config.SCENE_EMBEDDING).model,
+                    model=config.model,
                     input=batch,
                 )
             except Exception as exc:                    # noqa: BLE001
+                _report(scene, user_id, config, started, status=ai_usage.FAILED,
+                        error=f"{type(exc).__name__}: {exc}")
                 raise EmbeddingCallError(
                     f"嵌入失败（第 {start // batch_size + 1} 批，共 {len(batch)} 条）："
                     f"{type(exc).__name__}: {exc}"
                 ) from exc
+
+            # ★ 每批记一次账 —— 每批是一次真实的 API 调用，token 是分别计的
+            _report(scene, user_id, config, started, usage=resp.usage)
 
             # 按 index 排序，保证顺序和输入一致（API 不保证返回顺序）
             ordered = sorted(resp.data, key=lambda d: d.index)
@@ -132,15 +144,33 @@ class EmbeddingService:
         logger.debug("嵌入完成：%d 条，维度 %d", len(vectors), len(vectors[0]))
         return vectors
 
-    async def embed_one(self, text: str) -> list[float]:
+    async def embed_one(self, text: str, *,
+                        scene: str = ai_usage.SCENE_EMBEDDING,
+                        user_id: str | int | None = None) -> list[float]:
         """单条嵌入（检索时用）。"""
-        result = await self.embed([text])
+        result = await self.embed([text], scene=scene, user_id=user_id)
         return result[0]
 
     async def aclose(self) -> None:
         # client 是懒建的，可能压根没建过
         if self._openai is not None:
             await self._openai.close()
+
+
+def _report(scene: str, user_id: str | int | None, config: "ai_config.ModelConfig",
+            started: float, *, usage: object = None,
+            status: str = ai_usage.SUCCESS, error: str | None = None) -> None:
+    """记一次账（同步、内部异步发出去，不会抛异常）。"""
+    ai_usage.record(
+        scene=scene,
+        user_id=user_id,
+        provider=config.provider,
+        model=config.model,
+        usage=usage,
+        duration_ms=int((time.monotonic() - started) * 1000),
+        status=status,
+        error_message=error,
+    )
 
 
 # 模块级单例

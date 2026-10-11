@@ -164,6 +164,33 @@ class JavaClient:
         body = resp.json()
         return body.get("data") or []
 
+    # ---------- ④ AI 使用量 ----------
+
+    async def report_ai_usage(self, payload: dict) -> None:
+        """上报一次模型调用的用量。
+
+        Java 那边永远返回成功（落库失败它自己吞掉），所以这里只需要处理网络问题。
+        调用方是 ai_usage.record()，它已经把异常兜住了 —— 这个方法是「尽力而为」的一环。
+        """
+        resp = await self._client.post(self._url("/internal/ai-usage"), json=payload)
+        self._raise_for_status(resp, "上报 AI 使用量")
+
+    # ---------- ⑤ 提示词 ----------
+
+    async def list_prompts(self) -> list[dict]:
+        """拉取 Java 下发的已发布提示词（含正文）。
+
+        提示词正文在 Java（管理端维护，带版本管理和发布/回滚），本服务只是消费方 ——
+        由后台协程定期调用，见 app/services/prompt_store.py。
+
+        ⚠️ 返回的是【所有已发布】的，包括管理员标记为「不让用户切」的内部提示词。
+           能不能给用户用，由 prompt_store.find() 自己再挡一道。
+        """
+        resp = await self._client.get(self._url("/internal/prompts"))
+        self._raise_for_status(resp, "拉取提示词")
+        body = resp.json()
+        return body.get("data") or []
+
     # ---------- 生命周期 ----------
 
     async def aclose(self) -> None:

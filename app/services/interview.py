@@ -17,7 +17,7 @@ import logging
 from typing import Any
 
 from app.config import settings
-from app.services import prompt
+from app.services import prompt, ai_usage
 from app.services.json_utils import (
     clean_dict_list,
     clean_enum,
@@ -102,6 +102,7 @@ async def generate_questions(
         temperature=_EXTRACT_TEMPERATURE,
         max_tokens=settings.extract_max_tokens,
         timeout=settings.extract_timeout_seconds,
+        scene=ai_usage.SCENE_INTERVIEW_GENERATE,
     )
 
     questions = _normalize_questions(extract_json_object(raw), limit=count)
@@ -193,6 +194,7 @@ async def analyze_answer(
         temperature=_EXTRACT_TEMPERATURE,
         max_tokens=settings.extract_max_tokens,
         timeout=settings.extract_timeout_seconds,
+        scene=ai_usage.SCENE_INTERVIEW_ANALYZE,
     )
 
     result = _normalize_analysis(extract_json_object(raw))
@@ -280,6 +282,7 @@ async def build_report(
         temperature=_EXTRACT_TEMPERATURE,
         max_tokens=settings.extract_max_tokens,
         timeout=settings.extract_timeout_seconds,
+        scene=ai_usage.SCENE_INTERVIEW_REPORT,
     )
 
     result = _normalize_report(extract_json_object(raw))

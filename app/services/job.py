@@ -8,7 +8,7 @@ import logging
 from typing import Any
 
 from app.config import settings
-from app.services import prompt
+from app.services import prompt, ai_usage
 from app.services.json_utils import (
     clean_dict_list,
     clean_enum,
@@ -66,6 +66,7 @@ async def parse_job(text: str) -> dict[str, Any]:
         #    职责列表 + 技能列表很容易被截断成不合法的 JSON。
         max_tokens=settings.extract_max_tokens,
         timeout=settings.extract_timeout_seconds,
+        scene=ai_usage.SCENE_JOB_PARSE,
     )
 
     structured = _normalize(extract_json_object(raw))

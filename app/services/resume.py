@@ -10,7 +10,7 @@ import logging
 from typing import Any
 
 from app.config import settings
-from app.services import prompt
+from app.services import prompt, ai_usage
 from app.services.json_utils import (
     clean_dict_list,
     clean_enum,
@@ -81,6 +81,7 @@ async def parse_resume(text: str, *, target_position: str | None = None) -> dict
         max_tokens=settings.extract_max_tokens,
         # ⚠️ 同理，超时也不能用对话的 120 秒 —— 实测详细简历要跑满 120 秒。
         timeout=settings.extract_timeout_seconds,
+        scene=ai_usage.SCENE_RESUME_PARSE,
     )
 
     structured = _normalize(extract_json_object(raw))
@@ -281,6 +282,7 @@ async def analyze_resume(
         temperature=_EXTRACT_TEMPERATURE,
         max_tokens=settings.extract_max_tokens,
         timeout=settings.extract_timeout_seconds,
+        scene=ai_usage.SCENE_RESUME_ANALYZE,
     )
 
     result = _normalize_analysis(extract_json_object(raw))

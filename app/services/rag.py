@@ -11,6 +11,7 @@
 
 import logging
 
+from app.services import ai_usage
 from app.config import settings
 from app.services.embedding import embedding_service
 from app.services.vector_store import vector_store
@@ -52,7 +53,8 @@ async def search(
     # 上限兜底：topK 传太大会把一堆无关片段塞进 prompt，既费钱又降低答案质量
     k = min(max(1, k), settings.max_retrieval_top_k)
 
-    query_vector = await embedding_service.embed_one(query.strip())
+    query_vector = await embedding_service.embed_one(
+        query.strip(), scene=ai_usage.SCENE_EMBEDDING)
 
     results = await vector_store.query(
         knowledge_base_id=knowledge_base_id,      # ★ 安全边界在这里生效

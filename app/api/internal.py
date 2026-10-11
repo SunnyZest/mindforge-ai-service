@@ -94,6 +94,12 @@ class RagChatRequest(BaseModel):
     query: str = Field(min_length=1, description="用户问题")
     topK: int = Field(default=8, ge=1, le=50, description="检索片段数")
     enableRerank: bool = Field(default=False, description="是否重排序")
+    promptId: str | None = Field(
+        default=None,
+        description="回答风格 id（用户在界面上选的，见 GET /app/prompts）。"
+                    "不传 = 默认风格；传了但找不到 / 没开放给用户切换时也回退默认 —— "
+                    "用户上次选的风格被管理员下线了，不该让他的提问直接失败。",
+    )
     history: list[ChatHistoryItem] = Field(
         default_factory=list,
         description="历史消息（可选）。Java 侧从 chat_message 表取最近几轮传过来；"
@@ -118,6 +124,7 @@ async def rag_chat(req: RagChatRequest) -> dict:
         query=req.query,
         top_k=req.topK,
         history=[h.model_dump() for h in req.history],
+        prompt_id=req.promptId,
     )
 
     logger.info("对话请求：user=%s kb=%s conv=%s → hasAnswer=%s，%d 个引用",
@@ -173,6 +180,7 @@ async def rag_chat_stream(req: RagChatRequest) -> StreamingResponse:
                 query=req.query,
                 top_k=req.topK,
                 history=[h.model_dump() for h in req.history],
+                prompt_id=req.promptId,
             ):
                 yield _sse(evt["type"], evt)
 
