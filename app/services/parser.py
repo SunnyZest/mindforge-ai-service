@@ -85,21 +85,158 @@ def _parse_text(content: bytes) -> ParseResult:
 # ---------- PDF ----------
 
 
+# 缓存 RapidOCR 实例，避免单次任务重复初始化模型
+_rapid_ocr_instance = None
+
+
+def _get_rapid_ocr():
+    global _rapid_ocr_instance
+    if _rapid_ocr_instance is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+
+            _rapid_ocr_instance = RapidOCR()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("RapidOCR 初始化失败: %s", exc)
+            raise ParseError(f"本地 OCR 引擎加载失败: {exc}") from exc
+    return _rapid_ocr_instance
+
+
+def _ocr_page_dashscope(image_bytes: bytes) -> str:
+    """尝试使用 DashScope 视觉多模态大模型进行高精度排版 OCR。"""
+    try:
+        from app.config import settings
+        from app.services import ai_config
+
+        cfg = ai_config.get(ai_config.SCENE_CHAT)
+        api_key = cfg.api_key or settings.dashscope_api_key
+        base_url = cfg.base_url or settings.dashscope_base_url
+
+        if not api_key:
+            return ""
+
+        import base64
+        from openai import OpenAI
+
+        base64_img = base64.b64encode(image_bytes).decode("utf-8")
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=60.0,
+            max_retries=1,
+        )
+        response = client.chat.completions.create(
+            model="qwen-vl-ocr",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "请提取图片中的全部文字。保持原有的排版、标题层级与段落结构，遇到表格请使用 Markdown 语法还原表格，直接输出识别结果，不要输出任何额外的解释或问候。",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{base64_img}"},
+                        },
+                    ],
+                }
+            ],
+            temperature=0.01,
+        )
+        return (response.choices[0].message.content or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("DashScope OCR 调用跳过或失败: %s", exc)
+        return ""
+
+
+def _ocr_page_rapidocr(image) -> str:
+    """使用本地 RapidOCR (ONNX) 离线识别单页图片。"""
+    import numpy as np
+
+    ocr = _get_rapid_ocr()
+    result, _ = ocr(np.array(image))
+    if not result:
+        return ""
+    return "\n".join(item[1] for item in result if item and len(item) > 1 and item[1]).strip()
+
+
+def _parse_pdf_ocr(content: bytes) -> ParseResult:
+    """PDF OCR 降级处理：针对纯图片型扫描件。
+
+    优先尝试 DashScope 多模态 OCR（带表格与排版还原）；
+    若无 API Key 或网络调用失败，无缝回退至本地 RapidOCR 离线引擎。
+    """
+    import io
+    import pypdfium2 as pdfium
+
+    try:
+        pdf = pdfium.PdfDocument(content)
+    except Exception as exc:  # noqa: BLE001
+        raise ParseError(f"PDF 文件损坏，无法读取页面: {exc}") from exc
+
+    total_pages = len(pdf)
+    if total_pages == 0:
+        raise ParseError("PDF 文件没有任何页面")
+
+    # 防刷：单文档最多识别前 30 页
+    max_pages = min(total_pages, 30)
+    page_texts: list[str] = []
+
+    for i in range(max_pages):
+        page = pdf[i]
+        pil_image = page.render(scale=2.0).to_pil()
+
+        page_text = ""
+        # 1. 优先尝试云端多模态 OCR
+        try:
+            buf = io.BytesIO()
+            pil_image.save(buf, format="PNG")
+            page_text = _ocr_page_dashscope(buf.getvalue())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("第 %d 页 DashScope OCR 失败（%s），降级至本地 RapidOCR", i + 1, exc)
+
+        # 2. 回退本地 RapidOCR
+        if not page_text:
+            try:
+                page_text = _ocr_page_rapidocr(pil_image)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("第 %d 页 本地 RapidOCR 识别失败: %s", i + 1, exc)
+
+        if page_text.strip():
+            page_texts.append(f"<!-- Page {i + 1} -->\n{page_text.strip()}")
+
+    text = "\n\n".join(page_texts).strip()
+    if not text:
+        raise ParseError("PDF 扫描件经 OCR 处理后未能识别出任何文字内容")
+
+    return ParseResult(text=text, page_count=total_pages)
+
+
 def _parse_pdf(content: bytes) -> ParseResult:
-    """PDF —— 用 pdfplumber 提取文本。
+    """PDF —— 优先用 pdfplumber 提取原生文本，若为扫描件/图片型 PDF 则自动降级 OCR。
 
     为什么用 pdfplumber 而不是 pypdf：实测中文 PDF 下 pdfplumber 更快
     （0.47s vs 0.99s）且提取结果一样完整，对复杂排版的容忍度也更好。
-    pypdf 留作兜底 —— PDF 格式太杂，某些畸形文件 pdfplumber 会失败。
+    pypdf 留作兜底；扫描件自动走 OCR 识别。
     """
     try:
         return _parse_pdf_plumber(content)
-    except ParseError:
+    except ParseError as exc:
+        if "扫描件" in str(exc):
+            logger.info("pdfplumber 未提取到文本，切换至 OCR 引擎: %s", exc)
+            return _parse_pdf_ocr(content)
         raise
     except Exception as exc:                          # noqa: BLE001
         logger.warning("pdfplumber 提取失败（%s），改用 pypdf 重试", exc)
 
-    return _parse_pdf_pypdf(content)
+    try:
+        return _parse_pdf_pypdf(content)
+    except ParseError as exc:
+        if "扫描件" in str(exc):
+            logger.info("pypdf 未提取到文本，切换至 OCR 引擎: %s", exc)
+            return _parse_pdf_ocr(content)
+        raise
 
 
 def _parse_pdf_plumber(content: bytes) -> ParseResult:
