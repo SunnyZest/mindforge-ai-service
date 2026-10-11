@@ -86,12 +86,14 @@ def _env_config(scene: str) -> ModelConfig:
             model=settings.embedding_model,
             source="env",
         )
-    # RERANK 目前没有实现，先给一份和对话同源的兜底，免得调用方拿到 None
+    # RERANK 没有环境变量兜底 —— rerank 模型（gte-rerank 系列）和 chat 模型不是一回事，
+    # 拿 chat_model 冒充只会让调用打到一个不存在的端点上。model 留空表示「未配置」，
+    # rerank.configured() 据此判断，rag.search 未配置时直接跳过重排（走向量序）。
     return ModelConfig(
         scene=scene,
-        api_key=settings.dashscope_api_key,
+        api_key="",
         base_url=settings.dashscope_base_url,
-        model=settings.chat_model,
+        model="",
         source="env",
     )
 

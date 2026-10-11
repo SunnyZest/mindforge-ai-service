@@ -46,7 +46,7 @@ class RagSearchRequest(BaseModel):
     knowledgeBaseId: str = Field(description="知识库 id —— 数据隔离的安全边界")
     query: str = Field(min_length=1, description="用户问题")
     topK: int = Field(default=8, ge=1, le=50, description="返回片段数")
-    enableRerank: bool = Field(default=False, description="是否重排序")
+    enableRerank: bool = Field(default=False, description="是否用 rerank 模型精排。未配置 RERANK 模型或调用失败时降级回向量序，响应里的 reranked 字段如实反映是否生效")
 
 
 @router.post("/rag/search", summary="知识库语义检索")
@@ -56,14 +56,15 @@ async def rag_search(req: RagSearchRequest) -> dict:
     Java 侧的调用时机：用户提问 → Java 查权限 → 调这个接口拿相关片段 →
     自己组装 prompt 或把片段交给 /rag/chat。
     """
-    results = await rag.search(
+    results, reranked = await rag.search(
         knowledge_base_id=req.knowledgeBaseId,
         query=req.query,
         top_k=req.topK,
+        enable_rerank=req.enableRerank,
     )
 
-    logger.info("检索请求：user=%s kb=%s topK=%d → %d 条",
-                req.userId, req.knowledgeBaseId, req.topK, len(results))
+    logger.info("检索请求：user=%s kb=%s topK=%d → %d 条 reranked=%s",
+                req.userId, req.knowledgeBaseId, req.topK, len(results), reranked)
 
     return {
         "code": 0,
@@ -71,9 +72,9 @@ async def rag_search(req: RagSearchRequest) -> dict:
         "data": {
             "results": results,
             "total": len(results),
-            # enableRerank 目前不生效（没有接重排序模型）。
-            # 这里如实返回 false，而不是假装重排过了。
-            "reranked": False,
+            # 「请求了重排」不等于「重排生效了」：没配 RERANK 模型或调用失败时
+            # 会降级回向量序，这里如实返回，Java 拿它决定要不要展示「已精排」标记。
+            "reranked": reranked,
         },
     }
 
@@ -93,7 +94,7 @@ class RagChatRequest(BaseModel):
     conversationId: str | None = Field(default=None, description="会话 id（仅用于日志）")
     query: str = Field(min_length=1, description="用户问题")
     topK: int = Field(default=8, ge=1, le=50, description="检索片段数")
-    enableRerank: bool = Field(default=False, description="是否重排序")
+    enableRerank: bool = Field(default=False, description="是否用 rerank 模型精排。未配置 RERANK 模型或调用失败时降级回向量序，响应里的 reranked 字段如实反映是否生效")
     promptId: str | None = Field(
         default=None,
         description="回答风格 id（用户在界面上选的，见 GET /app/prompts）。"
@@ -181,6 +182,7 @@ async def rag_chat_stream(req: RagChatRequest) -> StreamingResponse:
                 top_k=req.topK,
                 history=[h.model_dump() for h in req.history],
                 prompt_id=req.promptId,
+                enable_rerank=req.enableRerank,
             ):
                 yield _sse(evt["type"], evt)
 

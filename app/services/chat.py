@@ -34,6 +34,7 @@ async def chat(
     top_k: int | None = None,
     history: list[dict] | None = None,
     prompt_id: str | None = None,
+    enable_rerank: bool = False,
 ) -> dict:
     """基于知识库回答问题。
 
@@ -72,7 +73,7 @@ async def chat(
     # ---------- ① 检索 ----------
     # min_relevance_score 过滤掉明显不相关的片段 ——
     # 宁可不答，也别拿不相关的内容硬凑，那样模型一定会编
-    sources = await _retrieve(knowledge_base_id, query, top_k)
+    sources = await _retrieve(knowledge_base_id, query, top_k, enable_rerank)
 
     if not sources:
         # 没检索到就【不调 LLM】—— 既省钱，也避免模型硬答
@@ -116,6 +117,7 @@ async def chat_stream(
     top_k: int | None = None,
     history: list[dict] | None = None,
     prompt_id: str | None = None,
+    enable_rerank: bool = False,
 ) -> AsyncIterator[dict]:
     """流式版 `chat()` —— 逐段吐事件，而不是攒完一次性返回。
 
@@ -156,7 +158,7 @@ async def chat_stream(
         raise ValueError("查询内容不能为空")
 
     # ---------- ① 检索 ----------
-    sources = await _retrieve(knowledge_base_id, query, top_k)
+    sources = await _retrieve(knowledge_base_id, query, top_k, enable_rerank)
 
     if not sources:
         # 和 chat() 一致：没检索到就不调模型，直接把兜底话术当成「一个 delta」吐出去，
@@ -205,6 +207,7 @@ async def _retrieve(
     knowledge_base_id: int | str,
     query: str,
     top_k: int | None,
+    enable_rerank: bool = False,
 ) -> list[dict]:
     """检索相关片段。
 
@@ -212,12 +215,14 @@ async def _retrieve(
     用的是同一套检索参数（尤其 min_relevance_score，
     改一处漏一处的话，流式和非流式会给出不一样的结果）。
     """
-    return await rag.search(
+    results, _ = await rag.search(
         knowledge_base_id=knowledge_base_id,
         query=query,
         top_k=top_k,
         min_score=settings.min_relevance_score,
+        enable_rerank=enable_rerank,
     )
+    return results
 
 
 def _build_messages(
