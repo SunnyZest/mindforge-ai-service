@@ -533,3 +533,27 @@ async def interview_report(req: InterviewReportRequest) -> dict:
                 req.userId, req.interviewId, result["overallScore"], len(req.items))
 
     return {"code": 0, "message": "成功", "data": result}
+
+
+# ---------- 网页正文提取工具 ----------
+
+
+class UrlExtractRequest(BaseModel):
+    """网页提取请求。"""
+
+    url: str = Field(min_length=1, description="目标网页 URL")
+
+
+@router.post("/tools/url-extract", summary="网页正文高纯度提取为 Markdown")
+async def tool_url_extract(req: UrlExtractRequest) -> dict:
+    """提取网页正文并转换为 Markdown。"""
+    from app.services.tools.web_extractor import extract_url
+
+    try:
+        data = await extract_url(req.url)
+        return {"code": 0, "message": "成功", "data": data}
+    except ValueError as exc:
+        return {"code": 40001, "message": str(exc), "data": None}
+    except Exception as exc:
+        logger.exception("网页提取失败: %s", exc)
+        return {"code": 50000, "message": f"网页提取失败: {exc}", "data": None}
