@@ -26,6 +26,9 @@ _NO_RESULT_MARKER = "提供的资料中没有找到相关内容"
 # 检索不到时直接返回给用户的兜底话术（注意开头必须包含上面的 marker）
 _NO_RESULT_ANSWER = _NO_RESULT_MARKER + "请尝试换个说法，或者确认相关内容是否已上传到该知识库。"
 
+# 未检索到知识库资料时的明确免责与专业解答标识
+_FALLBACK_PREFIX = "💡 **提示**：未在当前知识库中检索到直接相关资料，以下基于 MindForge AI 通用专业知识为您解答：\n\n"
+
 
 async def chat(
     *,
@@ -76,13 +79,16 @@ async def chat(
     sources = await _retrieve(knowledge_base_id, query, top_k, enable_rerank)
 
     if not sources:
-        # 没检索到就【不调 LLM】—— 既省钱，也避免模型硬答
-        logger.info("未检索到相关资料，直接返回兜底话术（不调用模型）")
+        # 知识库未命中资料时，优雅降级为通用大模型专业解答
+        logger.info("未检索到相关资料，优雅降级为通用大模型解答（kb=%s）", knowledge_base_id)
+        messages = _build_fallback_messages(query, history, prompt_id)
+        raw_answer = await llm_service.chat(messages, scene=ai_usage.SCENE_RAG_CHAT)
+        answer = f"{_FALLBACK_PREFIX}{raw_answer.strip()}"
         return {
-            "answer": _NO_RESULT_ANSWER,
+            "answer": answer,
             "sources": [],
             "hasContext": False,
-            "hasAnswer": False,
+            "hasAnswer": True,
             "contextTruncated": False,
         }
 
@@ -161,17 +167,27 @@ async def chat_stream(
     sources = await _retrieve(knowledge_base_id, query, top_k, enable_rerank)
 
     if not sources:
-        # 和 chat() 一致：没检索到就不调模型，直接把兜底话术当成「一个 delta」吐出去，
-        # 这样前端的渲染路径只有一条（不用为「没有上下文」单独写分支）
-        logger.info("未检索到相关资料，流式返回兜底话术（不调用模型）")
+        # 和 chat() 一致：知识库未命中资料时，流式降级为通用大模型专业解答
+        logger.info("未检索到相关资料，流式降级为通用大模型解答（kb=%s）", knowledge_base_id)
         yield {
             "type": "sources",
             "sources": [],
             "hasContext": False,
             "contextTruncated": False,
         }
-        yield {"type": "delta", "text": _NO_RESULT_ANSWER}
-        yield {"type": "done", "answer": _NO_RESULT_ANSWER, "hasAnswer": False}
+        # 先把免责与来源说明作为首个 delta 推给前端，即时反馈
+        yield {"type": "delta", "text": _FALLBACK_PREFIX}
+
+        messages = _build_fallback_messages(query, history, prompt_id)
+        pieces: list[str] = [_FALLBACK_PREFIX]
+        async for piece in llm_service.chat_stream(messages, scene=ai_usage.SCENE_RAG_CHAT):
+            pieces.append(piece)
+            yield {"type": "delta", "text": piece}
+
+        answer = "".join(pieces)
+        logger.info("流式降级对话完成：kb=%s，回答 %d 字（%d 段）",
+                    knowledge_base_id, len(answer), len(pieces))
+        yield {"type": "done", "answer": answer, "hasAnswer": True}
         return
 
     messages, truncated = _build_messages(sources, query, history, prompt_id)
@@ -246,6 +262,35 @@ def _build_messages(
     messages.extend(_trim_history(history))
     messages.append({"role": "user", "content": query.strip()})
     return messages, truncated
+
+
+def _build_fallback_messages(
+    query: str,
+    history: list[dict] | None,
+    prompt_id: str | None = None,
+) -> list[dict]:
+    """当知识库中未检索到相关内容时，构建通用顾问降级 prompt。
+
+    优先读取 prompts/rag_fallback.txt 或管理端下发的配置；
+    若加载失败则回退内置专业求职顾问提示词。
+    """
+    try:
+        system_prompt = prompt.render("rag_fallback", prompt_id=prompt_id)
+    except Exception as exc:
+        logger.warning("加载 rag_fallback 提示词失败，回退内置系统提示词: %s", exc)
+        system_prompt = (
+            "你是 MindForge AI 的智能求职与技术顾问。\n"
+            "当前用户的专属知识库中未检索到与提问直接相关的文档资料。\n"
+            "请基于你的专业通用技术知识、求职方法论与行业经验，为用户提供准确、深入、结构清晰且具有实操性的解答。\n"
+            "回答规则：\n"
+            "1. 用中文回答，条理清晰，重点突出，善用分点与粗体标出核心要点。\n"
+            "2. 保持专业、客观、严谨，避免编造事实。"
+        )
+
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    messages.extend(_trim_history(history))
+    messages.append({"role": "user", "content": query.strip()})
+    return messages
 
 
 def _build_context(sources: list[dict]) -> tuple[str, bool]:

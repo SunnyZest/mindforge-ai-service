@@ -126,6 +126,7 @@ async def rag_chat(req: RagChatRequest) -> dict:
         top_k=req.topK,
         history=[h.model_dump() for h in req.history],
         prompt_id=req.promptId,
+        enable_rerank=req.enableRerank,
     )
 
     logger.info("对话请求：user=%s kb=%s conv=%s → hasAnswer=%s，%d 个引用",
