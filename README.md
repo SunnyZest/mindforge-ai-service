@@ -1,384 +1,291 @@
-# MindForge AI Service
+# MindForge AI Service（Python AI 计算微服务）
 
-MindForge AI 的 Python AI 服务：文档解析、分块、向量化、RAG 检索与对话。
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python" alt="Python 3.12" />
+  <img src="https://img.shields.io/badge/FastAPI-0.115-009688?style=flat-square&logo=fastapi" alt="FastAPI" />
+  <img src="https://img.shields.io/badge/ChromaDB-0.5+-FF6F61?style=flat-square" alt="ChromaDB" />
+  <img src="https://img.shields.io/badge/DashScope-Alibaba%20Cloud-FF6A00?style=flat-square" alt="DashScope" />
+  <img src="https://img.shields.io/badge/Trafilatura-2.3-2E7D32?style=flat-square" alt="Trafilatura" />
+  <img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square" alt="License" />
+</p>
 
-**只给 Java 后端调用**，不对浏览器暴露。
+> **MindForge AI Service** 是 MindForge AI 系统的核心 AI 计算引擎与文本向量化中枢。  
+> 本服务采用 **FastAPI 异步架构** 与纯粹的 **无状态计算节点设计**，专注于异构多源文档智能解析、工业级网页正文提取与清洗、向量嵌入计算（Embedding）、Chroma 向量检索、SSE 逐字流式 RAG 问答推流及大模型推理。
+>
+> 🔒 **服务安全边界**：本服务定位为**内部计算中枢**，仅接受 Java 业务后端的调用（携带 `X-Service-Token`），**不直接向浏览器公网开放**。
 
-## 支持的文档格式
+---
 
-| 格式 | 处理方式 | 说明 |
-|---|---|---|
-| **TXT / MD** | 直接解码 | 自动识别 UTF-8 / GBK（中文记事本存的常是 GBK）|
-| **PDF** | pdfplumber，失败时用 pypdf 兜底 | 提取文本 + 页数；**扫描件（图片型）需要 OCR，目前不支持** |
-| **DOCX** | python-docx | 段落 + 表格；标题层级保留成 `#` 前缀 |
-| **HTML** | BeautifulSoup | 剔除 script / style / 注释；行内标签不断句 |
+## 目录
 
-**统一产出「带结构提示的纯文本」**：标题带 `#` 前缀，表格转成 `a | b | c` 的行。
-这样分块时能识别结构边界，检索回来的片段也更好读。
+- [一、 架构定位与设计哲学](#一-架构定位与设计哲学)
+- [二、 核心功能特性](#二-核心功能特性)
+- [三、 目录结构与模块说明](#三-目录结构与模块说明)
+- [四、 本地环境搭建与启动](#四-本地环境搭建与启动)
+- [五、 与 Java 主后端通信契约](#五-与-java-主后端通信契约)
+  - [1. 异步轮询认领流水线 (Pull 模式)](#1-异步轮询认领流水线-pull-模式)
+  - [2. 原生网页正文抽取工具接口](#2-原生网页正文抽取工具接口)
+  - [3. 同步语义检索接口](#3-同步语义检索接口)
+  - [4. RAG 知识问答与 SSE 流式推流](#4-rag-知识问答与-sse-流式推流)
+- [六、 自动化测试与质量保障](#六-自动化测试与质量保障)
+- [七、 避坑指南与生产调优](#七-避坑指南与生产调优)
+- [八、 未来演进路线图](#八-未来演进路线图)
 
-> ⚠️ 老的 `.doc`（Office 97-2003 二进制格式）**不支持** —— python-docx 只能读 `.docx`。
-> 这类文件在 Java 侧上传时就会被拒绝。
+---
 
-## 与 Java 的分工
+## 一、 架构定位与设计哲学
 
+### 1. 硬性职责边界（数据在 Java，计算在 Python）
 ```
-Spring Boot（Java）          本服务（Python）
-─────────────────────       ────────────────────
-拥有数据、权限、事务     ←→   只做计算，不连数据库、不判权限
+┌─────────────────────────────────┐           ┌─────────────────────────────────┐
+│     Java 业务后端 (Spring Boot)   │           │   Python AI 微服务 (FastAPI)     │
+├─────────────────────────────────┤           ├─────────────────────────────────┤
+│ • 拥有 MySQL 直连权与全局事务   │           │ • 纯粹无状态，不连数据库/不判权 │
+│ • 负责用户鉴权与 RBAC 权限隔离  │  REST/SSE │ • 异构文档清洗与网页正文抓取    │
+│ • 生成 OSS / MinIO 临时预签名   │ ◄───────► │ • 分块与 DashScope 向量嵌入     │
+│ • 会话上下文与业务状态机流转    │           │ • Chroma 向量索引与相似度检索   │
+└─────────────────────────────────┘           │ • SSE 首字 0.45s 逐字流式推流   │
+                                              └─────────────────────────────────┘
+```
+- **绝不越权**：Python 侧不直连业务数据库，不判断用户是否有权限访问某个知识库。所有权限由 Java 在调用前校验完毕。
+- **解耦存储**：文档解析时，Python 通过 Java 下发的有时效 **OSS/MinIO 预签名只读 URL** 下载二进制流，无需在 Python 端配置云存储 AccessKey。
+
+### 2. 去中心化异步流水线（主动轮询认领）
+- 文档处理是长耗时密集任务，本服务内置后台 Worker（`poller.py`），每 5 秒主动调用 Java 内部接口 `POST /internal/documents/claim`。
+- Java 端利用数据库 `FOR UPDATE SKIP LOCKED` 悲观锁保证多节点安全并发；Python 主动拉取任务（Pull 模式），天然防御 NAT 穿透阻断与系统过载背压。
+
+---
+
+## 二、 核心功能特性
+
+### 1. 异构文档归一化解析引擎
+无需笨重的 LangChain 依赖，使用轻量原生库统一产出带结构标记的 Markdown 文本：
+- **TXT / Markdown**：智能探测 UTF-8 / GBK 编码无损解码；
+- **PDF**：基于 `pdfplumber` 高保真提取文字与排版，提取失败时自动使用 `pypdf` 容错兜底；
+- **DOCX**：基于 `python-docx` 提取段落与表格，标题保留 `#` 结构，表格统一转为 Markdown 表格；
+- **HTML / 网页文章**：集成工业级 `trafilatura` 原生抽取引擎，毫秒级智能剔除广告、导航与页脚，提取高纯度正文标题与 Markdown。
+
+### 2. 智能重叠分块与向量化管道
+- **滑动窗口重叠切分**：按设定 `chunk_size`（如 500 token）与 `chunk_overlap`（如 50 token）保留上下文连续性；
+- **DashScope 阿里云百炼嵌入**：对接 `text-embedding-v1` 模型生成 1536 维高质量向量；
+- **ChromaDB 本地向量持久化**：以 `knowledge_base_id` 为安全集合隔离，支持余弦相似度（Cosine Distance）快速匹配。
+
+### 3. 首字 0.45s 逐字 SSE 流式推流与优雅降级
+- 支持标准的 `text/event-stream` SSE 传输协议；
+- **零门槛与未命中降级**：当用户未选择知识库或向量检索未能召回高置信度片段时，系统自动优雅降级为通用大模型解答，并附带明确的免责标识，坚决拒绝生硬报错。
+
+### 4. 脏向量孤儿数据闭环清理
+- 定时拉取 Java 逻辑删除（`deleted=1`）的文档列表，同步剔除 Chroma 中的历史向量分块，杜绝废弃文档在后续检索中被误召回。
+
+---
+
+## 三、 目录结构与模块说明
+
+```text
+mindforge-ai-service/
+├── app/
+│   ├── main.py                  # FastAPI 应用入口、生命周期钩子（启动轮询器）
+│   ├── config.py                # 集中化配置管理（基于 pydantic-settings 读取 .env）
+│   ├── api/
+│   │   ├── health.py            # 健康自检接口（/health 与 /health/java 连通性测试）
+│   │   └── internal.py          # /internal/ai/v1/** 供 Java 调用的同步接口
+│   ├── core/
+│   │   └── security.py          # X-Service-Token 服务间安全通信校验
+│   ├── clients/
+│   │   └── java_client.py       # 封装反向请求 Java 的 claim/status/chunks/purge 客户端
+│   ├── services/
+│   │   ├── parser.py            # 本地上传多格式文件（PDF/DOCX/TXT）解析器
+│   │   ├── splitter.py          # 结构化文本分块器（带重叠窗口与标点断句）
+│   │   ├── embedding.py         # DashScope 向量嵌入接口封装
+│   │   ├── vector_store.py      # ChromaDB 本地持久化与语义检索
+│   │   ├── pipeline.py          # 文档处理全流程编排（解析➔分块➔向量化➔回写）
+│   │   ├── rag.py               # RAG 知识检索与 Prompt 模板组装
+│   │   ├── llm.py               # DashScope Qwen 大模型交互层
+│   │   ├── chat.py              # 同步与 SSE 流式 RAG 对话逻辑
+│   │   └── tools/
+│   │       └── web_extractor.py # 基于 trafilatura 的工业级网页正文提取工具
+│   └── worker/
+│       └── poller.py            # 后台异步任务轮询认领守护线程
+├── data/
+│   └── chroma/                  # ChromaDB 向量数据持久化目录（Git 忽略）
+├── tests/
+│   └── unit/
+│       ├── test_web_extractor.py# 网页提取器单元测试
+│       ├── test_splitter.py     # 分块逻辑测试
+│       └── ...                  # 覆盖核心计算逻辑的单元测试集
+├── .env.example                 # 环境变量配置模板
+├── pyproject.toml               # uv / pip 项目元数据与依赖定义
+└── requirements.txt             # 生产环境依赖版本锁定表
 ```
 
-这条边界是硬性的 —— 文档 §十七 明确要求「Python 不自行决定用户是否有权限访问资源」。
+---
 
-## 通信方式
+## 四、 本地环境搭建与启动
 
-**本服务主动轮询 Java**（不是 Java 调本服务）：
+### 1. 环境准备
+- **Python**：`3.12` 及以上
+- 包管理器推荐使用现代极速工具 **[uv](https://docs.astral.sh/uv/)**（亦可使用原生 `pip`）
 
-```
-每 5 秒：
-  POST /internal/documents/claim       认领待处理文档（Java 会标成 PARSING）
-       ├─ 有任务 → 下载 → 解析 → 分块 → 向量化
-       │            PUT  /internal/documents/{id}/status    回写进度
-       │            POST /internal/documents/{id}/chunks    写分块
-       └─ 无任务 → sleep 5 秒
-```
+### 2. 安装项目依赖
 
-**为什么用轮询而不是 MQ**：Java 在 Windows 本机、本服务将来可能跑在 VM，
-NAT 网络下「VM → Windows」方向天然可达，不需要配端口转发。
-
-## 快速开始
-
-```powershell
-# 1. 建虚拟环境（uv 会读 .python-version 用 3.12）
-uv venv
-
-# 2. 装依赖
+```bash
+# 方式 A：使用 uv（推荐，秒级安装）
+uv venv --python 3.12
 uv sync
 
-# 3. 配置
-Copy-Item .env.example .env
-#    然后编辑 .env，填 JAVA_SERVICE_TOKEN 和 DASHSCOPE_API_KEY
+# 方式 B：使用原生 venv (Windows)
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
 
-# 4. 启动
-uv run uvicorn app.main:app --reload --port 8000
+# 方式 C：使用原生 venv (Linux / macOS)
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-## 验证连通性
+### 3. 配置环境变量
+复制根目录模板并创建 `.env`：
+```bash
+# Windows
+copy .env.example .env
 
-启动后看日志：
-
-```
-✅ 已连上 Java（http://localhost:8080/api），当前待处理文档 0 篇
-```
-
-或者手动探测：
-
-```
-浏览器打开 http://localhost:8000/health/java
+# Linux / macOS
+cp .env.example .env
 ```
 
-**能返回就说明两件事**：Java 可达 + 服务令牌正确。
+核心配置项详解（`.env`）：
+```env
+# Java 后端地址（必须包含 context-path /api）
+JAVA_BASE_URL=http://localhost:8080/api
 
-```
-{"status":"ok","javaBaseUrl":"http://localhost:8080/api","claimed":0}
-```
+# 内部双向通讯密钥（必须与 Java 端 mindforge.internal.service-token 完全一致）
+JAVA_SERVICE_TOKEN=5oiQ55Ge56Wl5Zac5qyi5a2Z5Y2a5paH
 
-如果返回 `{"status":"error", ... "401 ..."}` → `.env` 的 `JAVA_SERVICE_TOKEN`
-和 Java 的 `mindforge.internal.service-token` 不一致。
+# 阿里云百炼大模型密钥（必须配置）
+DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+CHAT_MODEL=qwen-plus
+EMBEDDING_MODEL=text-embedding-v1
 
-## 与 Java 的接口契约
+# Chroma 向量数据库持久化目录（推荐使用相对路径）
+CHROMA_PERSIST_DIRECTORY=data/chroma
 
-本服务通过 Java 的 **3 个内部接口**与后端交互。
+# 启用后台文档认领轮询器
+ENABLE_POLLER=true
 
-**所有请求都必须带 `X-Service-Token` 请求头**，值等于 Java 的
-`mindforge.internal.service-token`（两边配成完全一致）。
-
-### ① 认领待处理文档
-
-```http
-POST /internal/documents/claim?limit=10
-```
-
-```json
-{
-  "code": 0,
-  "data": [
-    {
-      "documentId": "18",
-      "knowledgeBaseId": "10",
-      "userId": "2",
-      "fileName": "spring-boot.txt",
-      "fileType": "TXT",
-      "fileSize": 5469,
-      "downloadUrl": "https://mindforge-ai.oss-cn-beijing.aliyuncs.com/...?Expires=..."
-    }
-  ]
-}
+# 服务端口
+SERVICE_PORT=8000
 ```
 
-**关键点**：
+### 4. 启动服务
 
-- 这是**认领**不是查询 —— Java 会把返回的文档状态改成 `PARSING`
-- **多实例安全**：Java 用 `FOR UPDATE SKIP LOCKED`，不同实例拿到不同的文档
-- `data` 为空数组 = 当前没任务（**正常情况，不是错误**）
-- `downloadUrl` 是 OSS **预签名地址**（有时效）—— 本服务不需要配 OSS 密钥
+```bash
+# 使用 uv 启动
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
-### ② 回写处理状态
-
-```http
-PUT /internal/documents/{id}/status
+# 或在虚拟环境下直接启动
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-```json
-{
-  "parseStatus": "SUCCESS",
-  "chunkStatus": "SUCCESS",
-  "vectorStatus": "PENDING",
-  "errorMessage": null,
-  "pageCount": 1
-}
+### 5. 验证健康状态与连通性
+- **查看 Swagger API 文档**：浏览器访问 `http://localhost:8000/docs`
+- **与 Java 后端连通性自检**：浏览器访问 `http://localhost:8000/health/java`  
+  若返回 `{"status":"ok","claimed":0}` 则说明与 Java 业务后端成功握手。
+
+---
+
+## 五、 与 Java 主后端通信契约
+
+所有调用接口（无论 Python 调 Java 还是 Java 调 Python）请求头均必须携带：  
+`X-Service-Token: <配置的通讯密钥>`
+
+### 1. 异步轮询认领流水线 (Pull 模式)
+Python 后台 Poller 驱动文档流转：
+```
+1. POST /internal/documents/claim?limit=10 ──► Java 认领并锁定未处理文档
+2. Python 下载 OSS 预签名流 ──► 解析 ──► 分块 ──► 写入向量库
+3. PUT  /internal/documents/{id}/status    ──► 分阶段上报进度 (PARSING ➔ CHUNKING ➔ SUCCESS)
+4. POST /internal/documents/{id}/chunks    ──► 批量持久化分块元数据到 MySQL
 ```
 
-**字段语义**：
-
-| 字段 | 说明 |
-|---|---|
-| `parseStatus` / `chunkStatus` / `vectorStatus` | `PENDING` → 处理中 → `SUCCESS` / `FAILED` |
-| **传 `null`** | **表示「不修改这个字段」** —— 所以可以分阶段上报 |
-| `errorMessage` | **例外**：只要不是 `null` 就写入（传 `""` 用来清空上次的错误）|
-| `pageCount` | 页数，`null` 表示不改 |
-
-### ③ 批量写入分块
-
-```http
-POST /internal/documents/{id}/chunks
-```
-
-```json
-{
-  "chunks": [
-    {
-      "chunkIndex": 0,
-      "content": "分块正文……",
-      "tokenCount": 200,
-      "pageNo": 1,
-      "vectorId": "chroma-uuid",
-      "metadataJson": "{\"section\":\"intro\"}"
-    }
-  ]
-}
-```
-
-**关键点**：
-
-- **幂等**：Java 内部先按 `document_id` 物理删、再批量插，
-  重复调用不会撞 `uk_doc_chunk_index` 唯一索引
-- 返回的 `data` 是写入条数
-- `chunks` 不能是空数组，`content` 不能为空
-
-### ④ 查询待清理向量的文档
-
-```http
-GET /internal/documents/pending-vector-purge?limit=100
-```
-
-```json
-{
-  "code": 0,
-  "data": [
-    { "documentId": "26", "knowledgeBaseId": "17", "userId": "2", "fileName": "a.txt" }
-  ]
-}
-```
-
-**为什么需要**：删除文档只做逻辑删除（`deleted = 1`），向量库里的向量不会自动消失 ——
-会留下「孤儿向量」，检索时可能召回已被删除的文档内容。
-本服务定期拉这个列表，删掉向量后再回写「已清理」。
-
-**为什么是「本服务来拉」而不是「Java 通知本服务」**：本服务将来可能跑在 NAT 后的虚拟机里，
-Java 主动调它需要端口转发，而这个方向天然可达。
-
-### ⑤ 标记向量已清除
-
-```http
-PUT /internal/documents/{id}/vector-purged
-```
-
-**幂等** —— 重复调用不会出错（第二次影响 0 行，按成功处理）。
-
-### 状态流转
-
-```
-PENDING ──认领──→ PARSING ──解析成功──→ SUCCESS（parse_status）
-                                  ↓
-                              CHUNKING ──→ SUCCESS（chunk_status）
-                                  ↓
-                              EMBEDDING ──→ SUCCESS（vector_status）
-                                  ↓
-                              三个阶段都 SUCCESS 才「可被检索」
-任意阶段出错 ──→ FAILED + error_message（用户可在前端点重试）
-```
-
-> ⚠️ **RAG 检索时必须过滤 `deleted = 0` 且 `vector_status = SUCCESS`**，
-> 否则会召回还没处理完、或者已被用户删掉的文档内容。
-
-### 错误码
-
-| HTTP | code | 含义 |
-|---|---|---|
-| 401 | 40101 | 服务令牌无效 —— **两边 token 不一致**（最常见的错）|
-| 404 | 40404 | 文档不存在 |
-| 400 | 40001 | 参数不合法（比如空分块列表）|
-| 409 | 40902 | 状态冲突 |
-| 500 | 50000 | 服务端错误 |
-
-## 本服务对外提供的接口
-
-本服务【只给 Java 调用】，路径前缀 `/internal/ai/v1`，同样用 `X-Service-Token` 校验。
-
-> **注意方向和上面相反**：文档处理是「本服务去拉 Java」，而这里的检索是「Java 调本服务」。
-> 因为检索要同步返回结果，用户在等着；而文档处理是长耗时任务，适合异步。
-
-### POST /internal/ai/v1/rag/search
-
-在指定知识库内做语义检索。
-
-```json
-{
-  "userId": "10001",
-  "knowledgeBaseId": "30001",
-  "query": "什么是 Spring Boot 自动配置？",
-  "topK": 8,
-  "enableRerank": false
-}
-```
-
-响应：
-
-```json
-{
-  "code": 0,
-  "message": "成功",
-  "data": {
-    "results": [
-      {
-        "chunkId": "doc18-chunk0",
-        "documentId": "18",
-        "knowledgeBaseId": "30001",
-        "chunkIndex": 0,
-        "content": "分块正文……",
-        "score": 0.8614
-      }
-    ],
-    "total": 1,
-    "reranked": false
+### 2. 原生网页正文抽取工具接口
+- **请求**：`POST /internal/ai/v1/tools/url-extract`
+  ```json
+  {
+    "url": "https://juejin.cn/post/728192837482"
   }
-}
-```
-
-**要点**：
-
-- `knowledgeBaseId` **必传** —— 它是数据隔离的安全边界，传空会返回 400
-- `userId` 只用于日志 —— 权限由 Java 在调用前查好（文档 §十七）
-- `score` 是 0~1 的相似度（已把 Chroma 的 cosine 距离换算过来）
-- `enableRerank` **暂不生效**（没接重排序模型），响应里 `reranked` 如实返回 `false`
-- 参数不合法统一返回 **HTTP 400 + `{code: 40001}`**，和 Java 的 `Result` 格式一致
-
-### POST /internal/ai/v1/rag/chat
-
-基于知识库回答问题。和 `/rag/search` 的区别：search 只返回片段，chat 会生成一段回答。
-
-```json
-{
-  "userId": "10001",
-  "knowledgeBaseId": "30001",
-  "conversationId": "90001",
-  "query": "解释 Spring Bean 生命周期",
-  "topK": 8,
-  "enableRerank": false,
-  "history": [
-    { "role": "user", "content": "上一个问题" },
-    { "role": "assistant", "content": "上一个回答" }
-  ]
-}
-```
-
-响应：
-
-```json
-{
-  "code": 0,
-  "message": "成功",
-  "data": {
-    "answer": "Spring Boot 的自动配置主要通过……",
-    "sources": [ { "chunkId": "...", "documentId": "32", "chunkIndex": 0, "score": 0.941, "content": "……" } ],
-    "hasContext": true,
-    "hasAnswer": true,
-    "contextTruncated": false
+  ```
+- **响应**：
+  ```json
+  {
+    "code": 0,
+    "message": "提取成功",
+    "data": {
+      "url": "https://juejin.cn/post/728192837482",
+      "title": "深入剖析 Java 垃圾回收器与内存分配策略",
+      "content": "# 深入剖析 Java 垃圾回收器...\n\n在 JVM 体系中...",
+      "wordCount": 3840
+    }
   }
-}
+  ```
+
+### 3. 同步语义检索接口
+- **请求**：`POST /internal/ai/v1/rag/search`
+  ```json
+  {
+    "knowledgeBaseId": "1001",
+    "query": "Spring Boot 自动装配原理是什么？",
+    "topK": 5
+  }
+  ```
+
+### 4. RAG 知识问答与 SSE 流式推流
+- **接口**：`POST /internal/ai/v1/rag/chat/stream`
+- **事件拓扑**：
+  ```text
+  event: sources
+  data: {"type":"sources","hasContext":true,"sources":[{"documentId":"12","chunkIndex":0,"score":0.92,"content":"..."}]}
+
+  event: delta
+  data: {"type":"text","text":"Spring Boot "}
+
+  event: delta
+  data: {"type":"text","text":"通过 @EnableAutoConfiguration..."}
+
+  event: done
+  data: {"type":"answer","hasAnswer":true,"answer":"完整聚合文本..."}
+  ```
+
+---
+
+## 六、 自动化测试与质量保障
+
+项目配备了严谨的单元测试套件，全面覆盖文本抽取、分块边界与 RAG 召回：
+
+```bash
+# 运行全部单元测试
+pytest tests/unit -v
+
+# 仅测试网页正文抽取工具
+pytest tests/unit/test_web_extractor.py -v
 ```
 
-**⚠️ `hasContext` 和 `hasAnswer` 是两回事，别混用**：
+---
 
-| 字段 | 含义 | 用途 |
-|---|---|---|
-| `hasContext` | 有没有检索到相关片段 | 展示「参考了 N 个片段」|
-| `hasAnswer` | 模型有没有给出实质回答 | 判断「要不要显示答案」|
+## 七、 避坑指南与生产调优
 
-两者都为 `true` 是常态。但 **`hasContext=true` + `hasAnswer=false` 也很常见** ——
-检索到了片段（相似度够高），但片段里没有用户问的那个信息，模型如实回答「资料里没有」。
-这时 `sources` 里有内容，但那些内容答不了这个问题。
+1. **ChromaDB 跨平台持久化路径**：
+   - 务必在 `.env` 中使用相对路径 `data/chroma`，严禁写入诸如 `D:\xxx` 的 Windows 盘符，以保证 Docker 容器化和 Linux 服务器部署无缝迁移。
+2. **多进程并发与 Chroma 锁冲突**：
+   - Chroma 本地嵌入式模式（DuckDB/SQLite 后端）不支持多进程并发写入。生产环境若开启多 Uvicorn Worker，建议保持单 Poller 线程认领，检索支持只读并发。
+3. **网页提取防反爬超时**：
+   - `web_extractor` 默认设置了 10 秒超时与标准浏览器 User-Agent 头；遇到极少数强反爬站点（如 Cloudflare 验证盾）时，会自动抛出规整的 400 提示错误，不会导致主进程挂起。
 
-**其他要点**：
+---
 
-- 模型被严格约束**只根据检索到的内容回答**，资料里没有的直接说「没有找到」，不编造
-- **检索不到内容时不会调用模型** —— 既省钱，也避免它硬答
-- `history` 可选，最多取最近 5 轮（太多会挤占参考资料的空间）
+## 八、 未来演进路线图
 
-## 本服务的接口文档（Swagger）
-
-启动后访问：
-
-```
-http://localhost:8000/docs        Swagger UI（FastAPI 自带）
-http://localhost:8000/redoc       ReDoc
-```
-
-## 目录结构
-
-```
-app/
-├── main.py                  FastAPI 入口 + 启动/关闭钩子
-├── config.py                配置（pydantic-settings 读 .env）
-├── api/
-│   ├── health.py            健康检查
-│   └── internal.py          /internal/ai/v1/**（供 Java 调用）
-├── core/
-│   └── security.py          X-Service-Token 校验
-├── clients/
-│   └── java_client.py       调 Java 的 claim / status / chunks
-├── services/
-│   ├── parser.py            文件 → 纯文本
-│   ├── splitter.py          文本分块
-│   ├── embedding.py         文本 → 向量（DashScope）
-│   ├── vector_store.py      向量存储与检索（Chroma）
-│   ├── pipeline.py          文档处理流水线
-│   ├── rag.py               RAG 检索
-│   ├── llm.py               对话模型（DashScope）
-│   └── chat.py              RAG 对话
-└── worker/
-    └── poller.py            轮询循环
-data/chroma/                 Chroma 向量库持久化目录
-```
-
-## 依赖管理
-
-用 [uv](https://docs.astral.sh/uv/)。常用命令：
-
-```powershell
-uv add xxx          加依赖（会写进 pyproject.toml 和 uv.lock）
-uv sync             按 uv.lock 同步环境
-uv run xxx          在项目环境里执行命令，不用手动 activate
-```
-
-> `uv.lock` 要提交到 git（锁定依赖版本）；`.venv` 不提交。
+- [ ] **交叉重排（Cross-Encoder Rerank）**：接入 BGE-Reranker 模型，将向量初筛 Top-20 二次精排至 Top-5，进一步提升 RAG 回答精准度；
+- [ ] **多模态与 OCR 扩展**：引入 PaddleOCR 支持图片型扫描版 PDF 简历精准识读；
+- [ ] **轻量实时语音接入（ASR/TTS）**：接入 SenseVoice / Whisper 流式语音识别与 CosyVoice 语音合成，支撑拟真口头语音面试；
+- [ ] **本地私有化大模型直连**：增加 Ollama / vLLM 兼容适配器，支持 DeepSeek-R1 / Qwen 本地离线部署。
