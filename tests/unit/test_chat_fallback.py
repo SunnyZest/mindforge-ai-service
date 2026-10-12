@@ -89,3 +89,23 @@ async def test_chat_with_sources_does_not_use_fallback_prefix():
         assert len(result["sources"]) == 1
         assert _FALLBACK_PREFIX not in result["answer"]
         assert "Spring Boot 3.3" in result["answer"]
+
+
+@pytest.mark.anyio
+async def test_pure_chat_without_knowledge_base():
+    """纯通用问答模式（不绑定知识库）：跳过检索，直接调用大模型，不带免责前缀。"""
+    with patch("app.services.chat._retrieve", new_callable=AsyncMock) as mock_retrieve, \
+         patch("app.services.chat.llm_service.chat", new_callable=AsyncMock) as mock_llm_chat:
+        mock_llm_chat.return_value = "面试时应该自信表达，突出自己的核心技术成果与项目亮点。"
+
+        result = await chat.chat(
+            knowledge_base_id=None,
+            query="面试如何自我介绍？",
+        )
+
+        mock_retrieve.assert_not_called()
+        assert result["hasContext"] is False
+        assert result["hasAnswer"] is True
+        assert result["sources"] == []
+        assert _FALLBACK_PREFIX not in result["answer"]
+        assert "面试时应该自信表达" in result["answer"]

@@ -32,17 +32,17 @@ _FALLBACK_PREFIX = "💡 **提示**：未在当前知识库中检索到直接相
 
 async def chat(
     *,
-    knowledge_base_id: int | str,
+    knowledge_base_id: int | str | None = None,
     query: str,
     top_k: int | None = None,
     history: list[dict] | None = None,
     prompt_id: str | None = None,
     enable_rerank: bool = False,
 ) -> dict:
-    """基于知识库回答问题。
+    """基于知识库回答问题（或作为通用顾问直接解答）。
 
     Args:
-        knowledge_base_id: 知识库 id —— **必传**，数据隔离的安全边界
+        knowledge_base_id: 知识库 id。若为 None/0/空，则跳过检索直接走通用专业大模型问答。
         query: 用户问题
         top_k: 检索片段数
         history: 历史消息 [{role, content}, ...]，最多取最近 N 轮。
@@ -58,14 +58,6 @@ async def chat(
           "contextTruncated": bool # 参考资料是否因为太长被截断
         }
 
-    ⚠️ hasContext 和 hasAnswer 是两回事，别混用：
-        hasContext=True + hasAnswer=False 是常见情况 ——
-        检索到了片段（相似度够高），但片段里并没有用户问的那个信息，
-        模型如实回答「资料里没有」。这时 sources 里会有内容，
-        但那些内容答不了这个问题。
-        前端展示「参考了 N 个片段」用 hasContext；
-        判断「要不要显示答案」用 hasAnswer。
-
     Raises:
         ValueError: 参数不合法
         RuntimeError: 模型调用失败
@@ -74,16 +66,29 @@ async def chat(
         raise ValueError("查询内容不能为空")
 
     # ---------- ① 检索 ----------
-    # min_relevance_score 过滤掉明显不相关的片段 ——
-    # 宁可不答，也别拿不相关的内容硬凑，那样模型一定会编
-    sources = await _retrieve(knowledge_base_id, query, top_k, enable_rerank)
+    is_pure_chat = (
+        knowledge_base_id is None
+        or str(knowledge_base_id).strip() in ("", "0", "None", "null")
+    )
+
+    if is_pure_chat:
+        sources = []
+    else:
+        sources = await _retrieve(knowledge_base_id, query, top_k, enable_rerank)
 
     if not sources:
-        # 知识库未命中资料时，优雅降级为通用大模型专业解答
-        logger.info("未检索到相关资料，优雅降级为通用大模型解答（kb=%s）", knowledge_base_id)
+        # 如果是用户显式发起的纯通用对话（未绑定知识库），直接给出专业解答，无需附加免责提示；
+        # 如果是绑定了知识库但未命中资料，附加友好的免责与来源标头。
+        if is_pure_chat:
+            logger.info("纯通用问答模式（无知识库绑定），直接调用大模型解答")
+            prefix = ""
+        else:
+            logger.info("未检索到相关资料，优雅降级为通用大模型解答（kb=%s）", knowledge_base_id)
+            prefix = _FALLBACK_PREFIX
+
         messages = _build_fallback_messages(query, history, prompt_id)
         raw_answer = await llm_service.chat(messages, scene=ai_usage.SCENE_RAG_CHAT)
-        answer = f"{_FALLBACK_PREFIX}{raw_answer.strip()}"
+        answer = f"{prefix}{raw_answer.strip()}"
         return {
             "answer": answer,
             "sources": [],
@@ -118,7 +123,7 @@ async def chat(
 
 async def chat_stream(
     *,
-    knowledge_base_id: int | str,
+    knowledge_base_id: int | str | None = None,
     query: str,
     top_k: int | None = None,
     history: list[dict] | None = None,
@@ -148,7 +153,7 @@ async def chat_stream(
     调用方没法再改状态码。见 internal.py 里对异常的处理。
 
     Args:
-        knowledge_base_id: 知识库 id —— **必传**，数据隔离的安全边界
+        knowledge_base_id: 知识库 id。若为 None/0/空，则跳过检索直接走通用专业大模型问答。
         query: 用户问题
         top_k: 检索片段数
         history: 历史消息，最多取最近 N 轮
@@ -164,28 +169,41 @@ async def chat_stream(
         raise ValueError("查询内容不能为空")
 
     # ---------- ① 检索 ----------
-    sources = await _retrieve(knowledge_base_id, query, top_k, enable_rerank)
+    is_pure_chat = (
+        knowledge_base_id is None
+        or str(knowledge_base_id).strip() in ("", "0", "None", "null")
+    )
+
+    if is_pure_chat:
+        sources = []
+    else:
+        sources = await _retrieve(knowledge_base_id, query, top_k, enable_rerank)
 
     if not sources:
-        # 和 chat() 一致：知识库未命中资料时，流式降级为通用大模型专业解答
-        logger.info("未检索到相关资料，流式降级为通用大模型解答（kb=%s）", knowledge_base_id)
+        if is_pure_chat:
+            logger.info("纯通用问答模式（无知识库绑定），流式调用大模型解答")
+            prefix = ""
+        else:
+            logger.info("未检索到相关资料，流式降级为通用大模型解答（kb=%s）", knowledge_base_id)
+            prefix = _FALLBACK_PREFIX
+
         yield {
             "type": "sources",
             "sources": [],
             "hasContext": False,
             "contextTruncated": False,
         }
-        # 先把免责与来源说明作为首个 delta 推给前端，即时反馈
-        yield {"type": "delta", "text": _FALLBACK_PREFIX}
+        if prefix:
+            yield {"type": "delta", "text": prefix}
 
         messages = _build_fallback_messages(query, history, prompt_id)
-        pieces: list[str] = [_FALLBACK_PREFIX]
+        pieces: list[str] = [prefix] if prefix else []
         async for piece in llm_service.chat_stream(messages, scene=ai_usage.SCENE_RAG_CHAT):
             pieces.append(piece)
             yield {"type": "delta", "text": piece}
 
         answer = "".join(pieces)
-        logger.info("流式降级对话完成：kb=%s，回答 %d 字（%d 段）",
+        logger.info("流式对话完成（无知识库/降级）：kb=%s，回答 %d 字（%d 段）",
                     knowledge_base_id, len(answer), len(pieces))
         yield {"type": "done", "answer": answer, "hasAnswer": True}
         return

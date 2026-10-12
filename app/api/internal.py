@@ -90,7 +90,7 @@ class RagChatRequest(BaseModel):
     """对话请求。字段名同样是 camelCase，对齐文档 §十七。"""
 
     userId: str = Field(description="调用方已确认的用户 id（本服务只用于日志，不校验权限）")
-    knowledgeBaseId: str = Field(description="知识库 id —— 数据隔离的安全边界")
+    knowledgeBaseId: str | None = Field(default=None, description="知识库 id（可选，为空或 0 表示通用 AI 问答）")
     conversationId: str | None = Field(default=None, description="会话 id（仅用于日志）")
     query: str = Field(min_length=1, description="用户问题")
     topK: int = Field(default=8, ge=1, le=50, description="检索片段数")
