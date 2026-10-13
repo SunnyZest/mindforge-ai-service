@@ -162,3 +162,21 @@ def test_render_error_points_at_file_source_when_no_remote(monkeypatch):
         prompt.render("rag_chat")          # 故意不传 context
 
     assert "prompts/rag_chat.txt" in str(excinfo.value)
+
+
+def test_user_input_with_curly_braces_does_not_crash(monkeypatch):
+    """★ 程序员求职场景回归：用户简历/代码片段里带 {id}、{userId}、{ref} 或同名占位符时，
+    绝不能误触发 PromptRenderError，也不能发生跨变量二次替换。"""
+    _stub_remote(monkeypatch, "简历：{resume_text}\n岗位：{job_text}")
+
+    rendered = prompt.render(
+        "resume_optimize",
+        resume_text='@GetMapping("/users/{id}") String get({userId}) { return "{job_text}"; }',
+        job_text="import {ref} from 'vue'",
+    )
+
+    assert "@GetMapping(\"/users/{id}\")" in rendered
+    assert "{userId}" in rendered
+    assert 'return "{job_text}";' in rendered, "resume_text 里的 {job_text} 绝不能被第二个参数覆盖"
+    assert "import {ref} from 'vue'" in rendered
+

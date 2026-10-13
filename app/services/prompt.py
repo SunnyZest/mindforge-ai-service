@@ -75,26 +75,31 @@ def render(name: str, *, prompt_id: str | None = None, **kwargs) -> str:
     """
     template, source = _template(name, prompt_id)
 
-    text = template
-    for key, value in kwargs.items():
-        text = text.replace("{" + key + "}", "" if value is None else str(value))
+    template_vars = set(_PLACEHOLDER.findall(template))
 
-    # 替换完还剩下的占位符 = 调用方漏传了（或者管理端配的那版占位符和代码对不上）。
-    # 必须报错 —— 否则模型会收到一个字面量 {context}，然后基于它胡说，
-    # 而你要盯着回答想半天「为什么它答得不对劲」。
-    missing = _PLACEHOLDER.findall(text)
+    # 校验模板里的占位符是否全部由调用方传入（在替换前检查模板本身，
+    # 避免用户输入/代码片段里的 {id}、{ref} 被误判成未填充的模板占位符）。
+    missing = sorted(template_vars - set(kwargs))
     if missing:
         raise PromptRenderError(
-            f"Prompt「{name}」（{source}）有占位符没填：{sorted(set(missing))}；"
+            f"Prompt「{name}」（{source}）有占位符没填：{missing}；"
             f"本次传入的是：{sorted(kwargs)}"
         )
 
     # 传了多余的变量：说明调用方和 prompt 已经对不上了，提醒一下
-    unused = set(kwargs) - set(_PLACEHOLDER.findall(template))
+    unused = set(kwargs) - template_vars
     if unused:
         logger.warning("Prompt「%s」（%s）收到未使用的变量：%s", name, source, sorted(unused))
 
-    return text
+    # 单次正则原子替换：防止参数 A 的值里若含有 "{param_b}" 被后续参数二次替换
+    def _repl(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key not in kwargs:
+            return match.group(0)
+        val = kwargs[key]
+        return "" if val is None else str(val)
+
+    return _PLACEHOLDER.sub(_repl, template)
 
 
 def _template(name: str, prompt_id: str | None) -> tuple[str, str]:
