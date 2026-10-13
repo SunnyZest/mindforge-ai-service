@@ -17,7 +17,7 @@ import logging
 from typing import Any
 
 from app.config import settings
-from app.services import prompt, ai_usage
+from app.services import prompt, rag, ai_usage
 from app.services.json_utils import (
     clean_dict_list,
     clean_enum,
@@ -48,8 +48,64 @@ _MAX_JOB_CHARS = 4000
 # 单条回答的上限 —— 防止用户贴了一整篇文章进来把 token 烧爆
 _MAX_ANSWER_CHARS = 6000
 
+# 注入面试出题的官方智库参考资料上限
+_MAX_REF_CHARS = 2500
+
 
 # ---------- 出题 ----------
+
+
+async def _retrieve_official_references(
+    knowledge_base_id: int | str | None,
+    *,
+    resume_clean: str,
+    job_clean: str,
+    interview_type: str,
+) -> str:
+    """从全站官方智库（或关联知识库）检索与当前岗位/简历匹配的真题与考核标准。
+
+    ⚠️ 增强而非强依赖：任何异常（如未配置嵌入模型、向量库为空）均静默降级为空串，
+    绝不阻断面试出题主流程。
+    """
+    if knowledge_base_id is None or str(knowledge_base_id).strip() in ("", "0", "None", "null"):
+        return ""
+
+    query_text = f"{interview_type} {job_clean[:500]} {resume_clean[:500]}".strip()
+    if not query_text:
+        return ""
+
+    try:
+        results, _ = await rag.search(
+            knowledge_base_id=knowledge_base_id,
+            query=query_text,
+            top_k=4,
+            min_score=settings.min_relevance_score,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("面试出题检索官方智库失败，降级为纯简历/JD出题（kb=%s）：%s", knowledge_base_id, exc)
+        return ""
+
+    if not results:
+        return ""
+
+    pieces: list[str] = []
+    total_chars = 0
+    for idx, item in enumerate(results, start=1):
+        content = (item.get("content") or "").strip()
+        if not content:
+            continue
+        if total_chars + len(content) > _MAX_REF_CHARS:
+            content = content[: max(0, _MAX_REF_CHARS - total_chars)]
+        if content:
+            pieces.append(f"[官方智库参考 {idx}]\n{content}")
+            total_chars += len(content)
+        if total_chars >= _MAX_REF_CHARS:
+            break
+
+    if pieces:
+        logger.info("面试出题已联合召回官方智库参考：kb=%s，命中 %d 段（共 %d 字符）",
+                    knowledge_base_id, len(pieces), total_chars)
+    return "\n\n".join(pieces)
 
 
 async def generate_questions(
@@ -59,8 +115,9 @@ async def generate_questions(
     interview_type: str = "TECHNICAL",
     difficulty: str = "MEDIUM",
     question_count: int = 5,
+    knowledge_base_id: int | str | None = None,
 ) -> dict[str, Any]:
-    """根据简历和 JD 出一套面试题。
+    """根据简历、JD 以及（可选）官方智库真题参考出一套面试题。
 
     Args:
         resume_text: 候选人简历原文，可空（不基于简历面试）
@@ -68,6 +125,7 @@ async def generate_questions(
         interview_type: TECHNICAL / BEHAVIORAL / MIXED
         difficulty: EASY / MEDIUM / HARD
         question_count: 题目数量
+        knowledge_base_id: 可选，官方智库（或关联知识库）ID，支持逗号分隔多 ID
 
     Returns:
         {"questions": [{question_no, question_type, question,
@@ -97,6 +155,21 @@ async def generate_questions(
         job_text=job_clean or "（未提供）",
     )
 
+    ref_text = await _retrieve_official_references(
+        knowledge_base_id,
+        resume_clean=resume_clean,
+        job_clean=job_clean,
+        interview_type=interview_type,
+    )
+    if ref_text:
+        system_prompt = (
+            f"{system_prompt.rstrip()}\n\n"
+            "【官方智库高频真题与考核标准参考】\n"
+            "（以下是从平台官方智库中检索到的与该岗位/候选人技术栈高度相关的面经真题与考察标准。"
+            "请在紧密贴合候选人简历与目标岗位 JD 的前提下，参考其中的深水区追问角度与评分要点来设计题目及 expectedPoints）：\n"
+            f"{ref_text}\n"
+        )
+
     raw = await llm_service.chat(
         [{"role": "system", "content": system_prompt}],
         temperature=_EXTRACT_TEMPERATURE,
@@ -107,8 +180,8 @@ async def generate_questions(
 
     questions = _normalize_questions(extract_json_object(raw), limit=count)
 
-    logger.info("面试出题完成：%d 道（类型 %s，难度 %s）",
-                len(questions), interview_type, difficulty)
+    logger.info("面试出题完成：%d 道（类型 %s，难度 %s，智库增强=%s）",
+                len(questions), interview_type, difficulty, bool(ref_text))
 
     return {"questions": questions}
 

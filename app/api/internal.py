@@ -352,6 +352,10 @@ class ResumeAnalyzeRequest(BaseModel):
         description="本次重点分析的部分：SUMMARY / WORK_EXPERIENCE / "
                     "PROJECT_EXPERIENCE / SKILLS / EDUCATION / OVERALL，可空 = 整体",
     )
+    knowledgeBaseId: str | None = Field(
+        default=None,
+        description="可选：用于检索官方智库标杆简历与考察标准的知识库 ID（支持逗号分隔多 ID）",
+    )
 
 
 @router.post("/resumes/analyze", summary="针对岗位给出简历改进建议")
@@ -367,11 +371,12 @@ async def resume_analyze(req: ResumeAnalyzeRequest) -> dict:
         req.resumeText,
         job_text=req.jobText,
         target=req.target,
+        knowledge_base_id=req.knowledgeBaseId,
     )
 
     need_fact = sum(1 for i in result["items"] if i["needsFact"])
-    logger.info("简历分析：user=%s resume=%s → %d 条建议（%d 条待补事实）",
-                req.userId, req.resumeId, len(result["items"]), need_fact)
+    logger.info("简历分析：user=%s resume=%s kb=%s → %d 条建议（%d 条待补事实）",
+                req.userId, req.resumeId, req.knowledgeBaseId, len(result["items"]), need_fact)
 
     return {"code": 0, "message": "成功", "data": result}
 
@@ -430,6 +435,10 @@ class InterviewGenerateRequest(BaseModel):
     questionCount: int = Field(default=5, ge=1, le=20, description="题目数量")
     resumeText: str | None = Field(default=None, description="候选人简历原文，可空")
     jobText: str | None = Field(default=None, description="目标岗位 JD 原文，可空")
+    knowledgeBaseId: str | None = Field(
+        default=None,
+        description="可选：用于联合检索官方智库真题与评分标准的知识库 ID（支持逗号分隔多 ID）",
+    )
 
 
 @router.post("/interviews/generate", summary="根据简历和 JD 出面试题")
@@ -446,10 +455,11 @@ async def interview_generate(req: InterviewGenerateRequest) -> dict:
         interview_type=req.interviewType,
         difficulty=req.difficulty,
         question_count=req.questionCount,
+        knowledge_base_id=req.knowledgeBaseId,
     )
 
-    logger.info("面试出题：user=%s interview=%s → %d 道题",
-                req.userId, req.interviewId, len(result["questions"]))
+    logger.info("面试出题：user=%s interview=%s kb=%s → %d 道题",
+                req.userId, req.interviewId, req.knowledgeBaseId, len(result["questions"]))
 
     return {"code": 0, "message": "成功", "data": result}
 

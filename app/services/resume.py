@@ -226,13 +226,69 @@ _MAX_ANALYZE_ITEMS = 5
 _MAX_JOB_CHARS = 4000
 
 
+# 分析时注入的官方智库参考资料上限
+_MAX_REF_CHARS = 2000
+
+
+async def _retrieve_resume_references(
+    knowledge_base_id: int | str | None,
+    *,
+    resume_clean: str,
+    job_clean: str,
+    target: str | None,
+) -> str:
+    """从官方智库检索同岗位标杆简历写法与考察重点（增强，失败静默降级）。"""
+    if knowledge_base_id is None or str(knowledge_base_id).strip() in ("", "0", "None", "null"):
+        return ""
+
+    from app.services import rag
+
+    query_text = f"{target or 'OVERALL'} {job_clean[:400]} {resume_clean[:400]}".strip()
+    if not query_text:
+        return ""
+
+    try:
+        results, _ = await rag.search(
+            knowledge_base_id=knowledge_base_id,
+            query=query_text,
+            top_k=3,
+            min_score=settings.min_relevance_score,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("简历分析检索官方智库失败，降级为常规分析（kb=%s）：%s", knowledge_base_id, exc)
+        return ""
+
+    if not results:
+        return ""
+
+    pieces: list[str] = []
+    total_chars = 0
+    for idx, item in enumerate(results, start=1):
+        content = (item.get("content") or "").strip()
+        if not content:
+            continue
+        if total_chars + len(content) > _MAX_REF_CHARS:
+            content = content[: max(0, _MAX_REF_CHARS - total_chars)]
+        if content:
+            pieces.append(f"[官方智库参考 {idx}]\n{content}")
+            total_chars += len(content)
+        if total_chars >= _MAX_REF_CHARS:
+            break
+
+    if pieces:
+        logger.info("简历优化已联合召回官方智库参考：kb=%s，命中 %d 段（共 %d 字符）",
+                    knowledge_base_id, len(pieces), total_chars)
+    return "\n\n".join(pieces)
+
+
 async def analyze_resume(
     text: str,
     *,
     job_text: str | None = None,
     target: str | None = None,
+    knowledge_base_id: int | str | None = None,
 ) -> dict[str, Any]:
-    """针对目标岗位给出简历改进建议。
+    """针对目标岗位给出简历改进建议（支持官方智库行业标准增强）。
 
     ★ <b>防虚构</b>：缺事实的地方标 `needs_fact=True`，让模型说清「要补什么」，
     而不是替用户编一个结果。约束写在 prompts/resume_analyze.txt 里，
@@ -242,6 +298,7 @@ async def analyze_resume(
         text: 简历原文
         job_text: 目标 JD 原文，可空（不针对具体岗位时按通用标准评）
         target: 本次重点分析的部分，可空 = 整体
+        knowledge_base_id: 可选，官方智库 ID（支持逗号分隔多 ID）
 
     Returns:
         {   # ⚠️ 键用 camelCase，理由见 _normalize_analysis 的说明
@@ -277,6 +334,21 @@ async def analyze_resume(
         target=target or "OVERALL",
     )
 
+    ref_text = await _retrieve_resume_references(
+        knowledge_base_id,
+        resume_clean=cleaned,
+        job_clean=job_clean,
+        target=target,
+    )
+    if ref_text:
+        system_prompt = (
+            f"{system_prompt.rstrip()}\n\n"
+            "【官方智库行业标杆与技术要点参考】\n"
+            "（以下是从平台官方智库中检索到的与该岗位/技术栈相关的行业标准与高频考察点，"
+            "请在提出改进建议时参考其中的专业技术深度与表达标准，但严禁替候选人编造未曾做过的事实）：\n"
+            f"{ref_text}\n"
+        )
+
     raw = await llm_service.chat(
         [{"role": "system", "content": system_prompt}],
         temperature=_EXTRACT_TEMPERATURE,
@@ -287,9 +359,10 @@ async def analyze_resume(
 
     result = _normalize_analysis(extract_json_object(raw))
 
-    logger.info("简历分析完成：%d 条建议，其中 %d 条需要用户补事实",
+    logger.info("简历分析完成：%d 条建议，其中 %d 条需要用户补事实（智库增强=%s）",
                 len(result["items"]),
-                sum(1 for i in result["items"] if i["needsFact"]))
+                sum(1 for i in result["items"] if i["needsFact"]),
+                bool(ref_text))
 
     return {**result, "truncated": truncated}
 

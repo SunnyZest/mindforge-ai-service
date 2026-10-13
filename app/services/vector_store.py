@@ -106,27 +106,33 @@ class VectorStore:
     async def query(
         self,
         *,
-        knowledge_base_id: int | str,
+        knowledge_base_id: int | str | list[int | str],
         query_embedding: list[float],
         top_k: int | None = None,
     ) -> list[dict[str, Any]]:
-        """在【指定知识库】内检索相似片段。
+        """在【指定知识库（支持单库或公私域多库联合）】内检索相似片段。
 
         ⚠️ knowledge_base_id 必传 —— 这不是可选参数，是安全边界。
+        支持传入单个 ID（如 "3"）、逗号分隔的多个 ID（如 "3,6"）或 ID 列表（如 [3, 6]）。
         传空会抛 ValueError，而不是「检索全部」。
 
         Returns:
             [{chunkId, documentId, knowledgeBaseId, chunkIndex, content, score}, ...]
             score 是 0~1 的相似度（已把 Chroma 的 cosine 距离换算过来）
         """
-        kb_id = self._require_kb_id(knowledge_base_id)
+        kb_ids = self._require_kb_ids(knowledge_base_id)
         k = top_k or settings.retrieval_top_k
+        where_filter: dict[str, Any] = (
+            {"knowledge_base_id": kb_ids[0]}
+            if len(kb_ids) == 1
+            else {"knowledge_base_id": {"$in": kb_ids}}
+        )
 
         def _query() -> dict:
             return self._collection.query(
                 query_embeddings=[query_embedding],
                 n_results=k,
-                where={"knowledge_base_id": kb_id},     # ★ 就是这一行
+                where=where_filter,     # ★ 单库精确匹配或多库 $in 联合检索
                 include=["documents", "metadatas", "distances"],
             )
 
@@ -154,7 +160,7 @@ class VectorStore:
                 "score": score,
             })
 
-        logger.info("检索完成：kb=%s，命中 %d 条", kb_id, len(results))
+        logger.info("检索完成：kb=%s，命中 %d 条", kb_ids, len(results))
         return results
 
     # ---------- 删除 ----------
@@ -179,20 +185,45 @@ class VectorStore:
 
     @staticmethod
     def _require_kb_id(value: int | str | None) -> int:
-        """校验 knowledge_base_id。
-
-        ⚠️ 这个校验是刻意做的 —— 它是防数据泄漏的最后一道闸。
-        如果哪天有人想「先不加过滤跑起来看看」，就会在这里被拦住。
-        """
+        """校验单个 knowledge_base_id。"""
         if value is None or str(value).strip() == "":
             raise ValueError(
                 "knowledge_base_id 不能为空 —— "
                 "缺少它会导致跨知识库检索，属于用户数据泄漏，已拒绝执行"
             )
         try:
-            return int(value)
+            return int(str(value).strip())
         except (TypeError, ValueError) as exc:
             raise ValueError(f"knowledge_base_id 不是合法整数：{value!r}") from exc
+
+    @classmethod
+    def _require_kb_ids(cls, value: int | str | list[int | str] | None) -> list[int]:
+        """校验并解析单或多个 knowledge_base_id（支持逗号分隔如 '3,6' 或列表 [3, 6]）。"""
+        if value is None:
+            raise ValueError(
+                "knowledge_base_id 不能为空 —— "
+                "缺少它会导致跨知识库检索，属于用户数据泄漏，已拒绝执行"
+            )
+        raw_items: list[int | str]
+        if isinstance(value, (list, tuple, set)):
+            raw_items = list(value)
+        else:
+            text = str(value).strip()
+            if not text:
+                raise ValueError(
+                    "knowledge_base_id 不能为空 —— "
+                    "缺少它会导致跨知识库检索，属于用户数据泄漏，已拒绝执行"
+                )
+            raw_items = [part.strip() for part in text.split(",") if part.strip()]
+
+        if not raw_items:
+            raise ValueError(
+                "knowledge_base_id 不能为空 —— "
+                "缺少它会导致跨知识库检索，属于用户数据泄漏，已拒绝执行"
+            )
+
+        parsed = [cls._require_kb_id(item) for item in raw_items]
+        return list(dict.fromkeys(parsed))
 
 
 # 模块级单例
