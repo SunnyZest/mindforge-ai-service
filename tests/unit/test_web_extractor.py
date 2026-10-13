@@ -16,6 +16,22 @@ async def test_extract_url_empty():
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "ssrf_url",
+    [
+        "http://localhost:8080/actuator",
+        "http://127.0.0.1:8000/internal/ai/v1/health",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://192.168.1.1/admin",
+        "http://10.0.0.1/secret",
+    ],
+)
+async def test_extract_url_blocks_ssrf(ssrf_url: str):
+    with pytest.raises(ValueError, match="禁止"):
+        await extract_url(ssrf_url)
+
+
+@pytest.mark.anyio
 async def test_extract_url_success():
     sample_html = """
     <!DOCTYPE html>
@@ -33,19 +49,33 @@ async def test_extract_url_success():
     </html>
     """
 
+    async def _aiter_bytes():
+        yield sample_html.encode("utf-8")
+
     mock_resp = MagicMock()
-    mock_resp.text = sample_html
+    mock_resp.status_code = 200
+    mock_resp.headers = {"content-type": "text/html; charset=utf-8"}
+    mock_resp.encoding = "utf-8"
     mock_resp.raise_for_status = MagicMock()
+    mock_resp.aiter_bytes = _aiter_bytes
+
+    mock_stream_ctx = AsyncMock()
+    mock_stream_ctx.__aenter__.return_value = mock_resp
+    mock_stream_ctx.__aexit__.return_value = None
 
     mock_client = AsyncMock()
-    mock_client.get.return_value = mock_resp
+    mock_client.stream = MagicMock(return_value=mock_stream_ctx)
     mock_client.__aenter__.return_value = mock_client
     mock_client.__aexit__.return_value = None
 
-    with patch("httpx.AsyncClient", return_value=mock_client):
+    with (
+        patch("app.services.tools.web_extractor._check_safe_hostname_sync", return_value=None),
+        patch("httpx.AsyncClient", return_value=mock_client),
+    ):
         result = await extract_url("https://example.com/java-interview-guide")
 
     assert result["url"] == "https://example.com/java-interview-guide"
     assert "Java" in result["title"]
     assert "HashMap" in result["content"]
     assert result["charCount"] > 20
+
