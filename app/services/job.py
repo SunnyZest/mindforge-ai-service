@@ -10,6 +10,7 @@ from typing import Any
 from app.config import settings
 from app.services import prompt, ai_usage
 from app.services.json_utils import (
+    clean_bool,
     clean_dict_list,
     clean_enum,
     clean_str,
@@ -120,6 +121,6 @@ def _normalize_skills(value: Any) -> list[dict[str, Any]]:
             "requiredLevel": clean_str(item.get("requiredLevel"), max_len=32),
             # required 是布尔语义：没写就按「加分项」处理（false），
             # 因为 JD 里没提「必须」的，多半就是可选项
-            "required": bool(item.get("required", False)),
+            "required": clean_bool(item.get("required"), default=False),
         })
     return result

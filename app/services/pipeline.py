@@ -109,7 +109,16 @@ async def process_document(task: dict) -> bool:
             }
             for i, piece in enumerate(pieces)
         ]
-        inserted = await java_client.save_chunks(document_id, chunks)
+        try:
+            inserted = await java_client.save_chunks(document_id, chunks)
+        except Exception:
+            if vector_ids:
+                try:
+                    await vector_store.delete_by_document(document_id)
+                    logger.info("  回滚已写入的 Chroma 向量（doc=%s）", document_id)
+                except Exception:  # noqa: BLE001
+                    logger.warning("  回滚 Chroma 向量失败（doc=%s）", document_id)
+            raise
 
         await java_client.update_status(
             document_id,

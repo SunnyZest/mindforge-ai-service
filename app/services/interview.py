@@ -402,10 +402,8 @@ def _format_qa_dump(items: list[dict[str, Any]]) -> str:
 
         score = it.get("score")
         answer = (it.get("answer") or "").strip()
-        # ⚠️ 字段名是 camelCase —— 这个 analysis 是 Java 从 /interviews/analyze
-        #    的响应里原样存下来再传回来的，那边的键就是 camelCase
-        missing = analysis.get("missingPoints") or []
-        weaknesses = technical.get("weaknesses") or []
+        missing = clean_str_list(analysis.get("missingPoints"), item_max_len=200, limit=10)
+        weaknesses = clean_str_list(technical.get("weaknesses"), item_max_len=200, limit=10)
 
         blocks.append(
             f"### 第 {it.get('questionNo')} 题"

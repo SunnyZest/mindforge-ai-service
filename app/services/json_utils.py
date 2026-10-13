@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 # 匹配开头的 ```json / ```JSON / ```
 _FENCE_START = re.compile(r"^```[a-zA-Z]*\s*")
 _FENCE_END = re.compile(r"\s*```$")
+_FENCE_BLOCK = re.compile(r"```(?:json|JSON)?\s*(\{[\s\S]*?\})\s*```")
 
 
 class JsonExtractError(ValueError):
@@ -45,14 +46,15 @@ def extract_json_object(text: str) -> dict[str, Any]:
         return obj
 
     # 再试「截取最外层花括号」—— 对付前后带解释的情况。
-    # 用 rfind 而不是 find 配对，是因为嵌套 JSON 里会有多层 {}，
-    # 取最后一个 } 才能把最外层对象完整包住。
-    start = cleaned.find("{")
+    # 若寒暄语句里自带了 {}（如 "针对 foo() {} 的分析："），从左向右逐个尝试 '{' 起点。
     end = cleaned.rfind("}")
-    if start != -1 and end > start:
-        obj = _try_load(cleaned[start:end + 1])
-        if obj is not None:
-            return obj
+    if end != -1:
+        pos = cleaned.find("{")
+        while pos != -1 and pos < end:
+            obj = _try_load(cleaned[pos:end + 1])
+            if obj is not None:
+                return obj
+            pos = cleaned.find("{", pos + 1)
 
     # ★ 花括号不闭合 = 输出被 max_tokens 截断了。
     #   必须和「模型格式跑偏」分开报：前者该去调大 extract_max_tokens，
@@ -71,9 +73,12 @@ def extract_json_object(text: str) -> dict[str, Any]:
 
 
 def _strip_fence(text: str) -> str:
-    if not text.startswith("```"):
-        return text
-    return _FENCE_END.sub("", _FENCE_START.sub("", text)).strip()
+    if text.startswith("```"):
+        return _FENCE_END.sub("", _FENCE_START.sub("", text)).strip()
+    m = _FENCE_BLOCK.search(text)
+    if m:
+        return m.group(1).strip()
+    return text
 
 
 def _try_load(text: str) -> dict[str, Any] | None:
@@ -125,27 +130,43 @@ def clean_enum(value: Any, allowed: set[str]) -> str | None:
 def clean_float(value: Any, *, lo: float = 0.0, hi: float = 99.9) -> float | None:
     """转成浮点数，超出范围或无法解析都返回 None。
 
-    能处理 "3"、"3.5"、3、"3年" 这几种写法 —— 模型很爱带单位。
+    能处理 "3"、"3.5"、3、"3年" 以及 "2021-2024 (3年)" 这几种写法。
     hi 默认 99.9 是为了对齐 decimal(4,1) 的取值上限。
     """
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
         number = float(value)
-    else:
-        match = re.search(r"-?\d+(?:\.\d+)?", str(value))
-        if not match:
-            return None
-        number = float(match.group())
-    if number < lo or number > hi:
+        if lo <= number <= hi:
+            return round(number, 1)
         return None
-    return round(number, 1)
+
+    for match in re.finditer(r"-?\d+(?:\.\d+)?", str(value)):
+        number = float(match.group())
+        if lo <= number <= hi:
+            return round(number, 1)
+    return None
 
 
 def clean_int(value: Any, *, lo: int = 0, hi: int = 100000) -> int | None:
     """转成整数，超出范围或无法解析返回 None。"""
     number = clean_float(value, lo=lo, hi=hi)
     return None if number is None else int(number)
+
+
+def clean_bool(value: Any, *, default: bool = False) -> bool:
+    """转成布尔值，兼容字符串 "true"/"false"/"是"/"否" 等模型输出，防止 bool("false") == True。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in {"true", "1", "yes", "y", "是", "必选", "必须"}:
+            return True
+        if s in {"false", "0", "no", "n", "否", ""}:
+            return False
+    return default
 
 
 def clean_str_list(value: Any, *, item_max_len: int = 255, limit: int = 50) -> list[str]:
