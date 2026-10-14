@@ -312,7 +312,7 @@ async def job_parse(req: JobParseRequest) -> dict:
     """把 JD 文本结构化成技能 / 经验 / 学历 / 职责。
 
     文档 §十七 的内部接口清单里没列这个（只列了 Resume AI 和 Interview AI），
-    但阶段 12 的 POST /api/app/jobs/{id}/parse 需要它，所以补上。
+    但用户端的 POST /api/app/jobs/{id}/parse 需要它，所以补上。
     """
     parsed = await job.parse_job(req.text)
 
