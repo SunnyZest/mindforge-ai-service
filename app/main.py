@@ -50,13 +50,13 @@ async def _probe_java() -> None:
     """
     try:
         docs = await java_client.claim(limit=1)
-        logger.info("✅ 已连上 Java（%s），当前待处理文档 %d 篇",
+        logger.info("已连上 Java（%s），当前待处理文档 %d 篇",
                     settings.java_base_url, len(docs))
         if docs:
             logger.info("   认领到：%s（会由轮询任务继续处理）",
                         [d.get("fileName") for d in docs])
     except Exception as exc:                       # noqa: BLE001
-        logger.error("❌ 连不上 Java：%s", exc)
+        logger.error("连不上 Java：%s", exc)
         logger.error("   请检查：① Java 是否已启动  ② JAVA_SERVICE_TOKEN 是否与 Java 一致")
 
 

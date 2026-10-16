@@ -27,7 +27,7 @@ _NO_RESULT_MARKER = "提供的资料中没有找到相关内容"
 _NO_RESULT_ANSWER = _NO_RESULT_MARKER + "请尝试换个说法，或者确认相关内容是否已上传到该知识库。"
 
 # 未检索到知识库资料时的明确免责与专业解答标识
-_FALLBACK_PREFIX = "💡 **提示**：未在当前知识库中检索到直接相关资料，以下基于 MindForge AI 通用专业知识为您解答：\n\n"
+_FALLBACK_PREFIX = "**提示**：未在当前知识库中检索到直接相关资料，以下基于 MindForge AI 通用专业知识为您解答：\n\n"
 
 
 async def chat(
