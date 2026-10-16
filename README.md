@@ -12,7 +12,7 @@
 > **MindForge AI Service** 是 MindForge AI 系统的核心 AI 计算引擎与文本向量化中枢。  
 > 本服务采用 **FastAPI 异步架构** 与纯粹的 **无状态计算节点设计**，专注于异构多源文档智能解析、工业级网页正文提取与清洗、向量嵌入计算（Embedding）、Chroma 向量检索、SSE 逐字流式 RAG 问答推流及大模型推理。
 >
-> 🔒 **服务安全边界**：本服务定位为**内部计算中枢**，仅接受 Java 业务后端的调用（携带 `X-Service-Token`），**不直接向浏览器公网开放**。
+> **服务安全边界**：本服务定位为**内部计算中枢**，仅接受 Java 业务后端的调用（携带 `X-Service-Token`），**不直接向浏览器公网开放**。
 
 ---
 
@@ -85,37 +85,45 @@
 mindforge-ai-service/
 ├── app/
 │   ├── main.py                  # FastAPI 应用入口、生命周期钩子（启动轮询器）
-│   ├── config.py                # 集中化配置管理（基于 pydantic-settings 读取 .env）
+│   ├── config.py                # 集中化配置管理（pydantic-settings 读 .env）
 │   ├── api/
-│   │   ├── health.py            # 健康自检接口（/health 与 /health/java 连通性测试）
-│   │   └── internal.py          # /internal/ai/v1/** 供 Java 调用的同步接口
+│   │   ├── health.py            # 健康自检（/health 与 /health/java 连通性测试）
+│   │   └── internal.py          # /internal/ai/v1/** 供 Java 调用的全部接口
 │   ├── core/
 │   │   └── security.py          # X-Service-Token 服务间安全通信校验
 │   ├── clients/
-│   │   └── java_client.py       # 封装反向请求 Java 的 claim/status/chunks/purge 客户端
+│   │   └── java_client.py       # 反向请求 Java 的 claim/status/chunks/purge 客户端
 │   ├── services/
-│   │   ├── parser.py            # 本地上传多格式文件（PDF/DOCX/TXT）解析器
-│   │   ├── splitter.py          # 结构化文本分块器（带重叠窗口与标点断句）
-│   │   ├── embedding.py         # DashScope 向量嵌入接口封装
-│   │   ├── vector_store.py      # ChromaDB 本地持久化与语义检索
-│   │   ├── pipeline.py          # 文档处理全流程编排（解析➔分块➔向量化➔回写）
-│   │   ├── rag.py               # RAG 知识检索与 Prompt 模板组装
-│   │   ├── llm.py               # DashScope Qwen 大模型交互层
-│   │   ├── chat.py              # 同步与 SSE 流式 RAG 对话逻辑
+│   │   ├── parser.py            # 多格式解析（含扫描件 PDF 双引擎 OCR 降级）
+│   │   ├── downloader.py        # 预签名 URL 流式下载（逐跳校验重定向 + 5MB 上限防 SSRF）
+│   │   ├── splitter.py          # 结构化文本分块（重叠窗口 + 标点断句）
+│   │   ├── embedding.py         # DashScope 向量嵌入
+│   │   ├── vector_store.py      # ChromaDB 持久化与语义检索
+│   │   ├── rerank.py            # Rerank 交叉精排（未配置/失败自动降级回向量序）
+│   │   ├── pipeline.py          # 文档处理编排（解析➔分块➔向量化➔回写 + 失败回滚向量）
+│   │   ├── rag.py               # RAG 检索编排（召回放大→精排收窄→阈值过滤）
+│   │   ├── chat.py              # 同步与 SSE 流式 RAG 对话（含未命中优雅降级）
+│   │   ├── llm.py               # 大模型交互层（配置变更自动重建 client）
+│   │   ├── prompt.py            # Prompt 渲染（管理端版本优先 → prompts/*.txt 兜底）
+│   │   ├── prompt_store.py      # 管理端下发的 Prompt 版本缓存
+│   │   ├── ai_config.py         # 模型配置解析（管理端下发优先 → .env 兜底，定时刷新）
+│   │   ├── ai_usage.py          # AI 用量记账（尽力而为，失败不阻塞主流程）
+│   │   ├── json_utils.py        # LLM JSON 输出强制矫正
+│   │   ├── resume.py            # 简历解析 / 定向优化
+│   │   ├── job.py               # 职位 JD 解析
+│   │   ├── match.py             # 简历-JD 匹配（五类结论）
+│   │   ├── interview.py         # 模拟面试出题 / 评分 / 复盘报告
 │   │   └── tools/
-│   │       └── web_extractor.py # 基于 trafilatura 的工业级网页正文提取工具
+│   │       └── web_extractor.py # trafilatura 网页正文提取（防 SSRF）
 │   └── worker/
-│       └── poller.py            # 后台异步任务轮询认领守护线程
+│       └── poller.py            # 后台轮询认领守护线程
 ├── data/
-│   └── chroma/                  # ChromaDB 向量数据持久化目录（Git 忽略）
+│   └── chroma/                  # ChromaDB 向量持久化目录（Git 忽略）
 ├── tests/
-│   └── unit/
-│       ├── test_web_extractor.py# 网页提取器单元测试
-│       ├── test_splitter.py     # 分块逻辑测试
-│       └── ...                  # 覆盖核心计算逻辑的单元测试集
+│   ├── unit/                    # 单元测试集（解析/分块/检索/精排/网页提取…）
+│   └── e2e/                     # 端到端测试（默认 deselect，需真实服务）
 ├── .env.example                 # 环境变量配置模板
-├── pyproject.toml               # uv / pip 项目元数据与依赖定义
-└── requirements.txt             # 生产环境依赖版本锁定表
+└── pyproject.toml               # 项目元数据与依赖定义（★ 没有 requirements.txt）
 ```
 
 ---
@@ -129,20 +137,22 @@ mindforge-ai-service/
 ### 2. 安装项目依赖
 
 ```bash
-# 方式 A：使用 uv（推荐，秒级安装）
+# 方式 A：使用 uv（推荐，依赖定义在 pyproject.toml）
 uv venv --python 3.12
 uv sync
 
-# 方式 B：使用原生 venv (Windows)
+# 方式 B：原生 venv (Windows)
 python -m venv .venv
 .\.venv\Scripts\activate
-pip install -r requirements.txt
+pip install .
 
-# 方式 C：使用原生 venv (Linux / macOS)
+# 方式 C：原生 venv (Linux / macOS)
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install .
 ```
+>本仓库**没有 `requirements.txt`**，依赖统一声明在 `pyproject.toml` 的 `dependencies`；
+> 新增依赖请用 `uv add xxx`（会自动写入 pyproject）。
 
 ### 3. 配置环境变量
 复制根目录模板并创建 `.env`：
@@ -164,6 +174,7 @@ JAVA_SERVICE_TOKEN=5oiQ55Ge56Wl5Zac5qyi5a2Z5Y2a5paH
 
 # 阿里云百炼大模型密钥（必须配置）
 DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+#模型名只是【环境变量兜底】：管理端「AI 配置」里配了同名场景会优先生效
 CHAT_MODEL=qwen-plus
 EMBEDDING_MODEL=text-embedding-v1
 
@@ -285,7 +296,12 @@ pytest tests/unit/test_web_extractor.py -v
 
 ## 八、 未来演进路线图
 
-- [ ] **交叉重排（Cross-Encoder Rerank）**：接入 BGE-Reranker 模型，将向量初筛 Top-20 二次精排至 Top-5，进一步提升 RAG 回答精准度；
-- [ ] **多模态与 OCR 扩展**：引入 PaddleOCR 支持图片型扫描版 PDF 简历精准识读；
-- [ ] **轻量实时语音接入（ASR/TTS）**：接入 SenseVoice / Whisper 流式语音识别与 CosyVoice 语音合成，支撑拟真口头语音面试；
-- [ ] **本地私有化大模型直连**：增加 Ollama / vLLM 兼容适配器，支持 DeepSeek-R1 / Qwen 本地离线部署。
+> 已完成的能力（**不再是 `[ ]` 待做**）：
+> - **交叉重排（Cross-Encoder Rerank）** —— `services/rerank.py`，走 DashScope 原生 rerank 端点；
+>   未配置 RERANK 模型或调用失败时**自动降级回向量序**，响应里 `reranked` 如实反映。
+> - **多模态与 OCR 扩展** —— `services/parser.py` 双引擎降级：`qwen-vl-ocr`（云端）→ `RapidOCR`（本地），
+>   **仅处理前 30 页**（控制耗时与成本）。
+>
+> 仍未做：
+> - [ ] **轻量实时语音接入（ASR/TTS）**：接入 SenseVoice / Whisper 流式语音识别与 CosyVoice 语音合成，支撑拟真口头语音面试；
+> - [ ] **本地私有化大模型直连**：增加 Ollama / vLLM 兼容适配器，支持 DeepSeek-R1 / Qwen 本地离线部署。
