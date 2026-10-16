@@ -19,7 +19,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.core.security import verify_service_token
-from app.services import chat, interview, job, match, rag, resume
+from app.services import ai_config, chat, interview, job, match, rag, resume
 from app.services.downloader import download_bytes
 from app.services.embedding import EmbeddingCallError
 from app.services.llm import LlmCallError
@@ -567,3 +567,36 @@ async def tool_url_extract(req: UrlExtractRequest) -> dict:
     except Exception as exc:
         logger.exception("网页提取失败: %s", exc)
         return {"code": 50000, "message": f"网页提取失败: {exc}", "data": None}
+
+
+# ---------- 服务能力状态 ----------
+
+
+@router.get("/status", summary="AI 能力状态（供 Java 组装首页状态徽章）")
+async def ai_status() -> dict:
+    """AI 能力当前是否可用。
+
+    ⚠️ 刻意【不返回模型名】—— 这个接口只用来回答「AI 能不能用」，
+       把内部选型摊到用户端没有任何好处：模型会换、会降级，
+       写死在前端反而稳定，写活了反而一改配置首页就变。
+
+    判断依据是 RAG_CHAT 场景解析出的配置是否 model 与 api_key 都非空。
+    key 缺失是本地/预发最常踩的坑 —— 表现是「所有 AI 功能都报未配置模型」，
+    但首页那个状态徽章却依然是绿的（这正是加这个接口的原因）。
+
+    ⚠️ 用 {@code ai_config.SCENE_CHAT}（值是 "CHAT"），<b>不是</b>
+       {@code ai_usage.SCENE_RAG_CHAT}（值是 "RAG_CHAT"）。项目里这两套场景常量
+       是分开的：前者给「模型配置解析」用，后者给「用量记账」用。
+       用错会落到 ai_config 的「无 env 兜底」分支，导致永远报未配置。
+    """
+    chat_cfg = ai_config.get(ai_config.SCENE_CHAT)
+    configured = bool(chat_cfg.model.strip()) and bool(chat_cfg.api_key.strip())
+    return {
+        "code": 0,
+        "message": "成功",
+        "data": {
+            "llmConfigured": configured,
+            # 只报「配置从哪来」（java 下发 / env 兜底），同样不含模型名
+            "configSource": chat_cfg.source,
+        },
+    }
