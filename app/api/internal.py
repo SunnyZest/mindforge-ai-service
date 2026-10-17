@@ -20,7 +20,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.core.security import verify_service_token
-from app.services import ai_config, chat, interview, job, match, rag, resume
+from app.services import ai_config, chat, interview, job, match, rag, resume, salary
 from app.services.downloader import download_bytes
 from app.services.embedding import EmbeddingCallError
 from app.services.llm import LlmCallError
@@ -420,6 +420,53 @@ async def resume_match(req: ResumeMatchRequest) -> dict:
 
     logger.info("简历匹配：user=%s resume=%s job=%s → %d 条要求 %s",
                 req.userId, req.resumeId, req.jobId, len(result["items"]), counts)
+
+    return {"code": 0, "message": "成功", "data": result}
+
+
+# ---------- 薪酬估算 ----------
+
+
+class SalaryEstimateRequest(BaseModel):
+    """薪酬估算请求。
+
+    ★ 不传简历、不传 JD：这个功能刻意做成「几个参数就能问」，
+    绑简历会把门槛抬得比收益还高。userId 只用于用量记账。
+    """
+
+    userId: str = Field(description="调用方已确认的用户 id（仅用于日志与用量记账）")
+    city: str = Field(min_length=1, max_length=64, description="城市")
+    position: str = Field(min_length=1, max_length=128, description="岗位名称")
+    yearsOfExperience: int = Field(ge=0, le=40, description="工作年限")
+    education: str | None = Field(default=None, max_length=32, description="学历，可空")
+    companyType: str | None = Field(default=None, max_length=32, description="公司类型，可空")
+    skills: list[str] = Field(default_factory=list, description="技术栈")
+    currentAnnualSalary: float | None = Field(
+        default=None, ge=0, description="当前年包（元），可空")
+
+
+@router.post("/salary/estimate", summary="薪酬估算（P50 / P75 / P90 参考区间）")
+async def salary_estimate(req: SalaryEstimateRequest) -> dict:
+    """按城市 / 岗位 / 年限推算薪酬参考区间。
+
+    ★ 这是**估算**，不是市场行情：本服务没有真实薪酬样本，
+    模型是按训练数据里的岗位画像在推。所以响应里没有样本量 / 数据来源这类字段，
+    免责声明由 Java 侧固定拼接（不交给模型写）。
+    """
+    result = await salary.estimate(
+        city=req.city,
+        position=req.position,
+        years_of_experience=req.yearsOfExperience,
+        education=req.education,
+        company_type=req.companyType,
+        skills=req.skills,
+        current_annual_salary=req.currentAnnualSalary,
+    )
+
+    logger.info("薪酬估算：user=%s city=%s position=%s years=%s → 月薪 %s/%s/%s 置信度 %s",
+                req.userId, req.city, req.position, req.yearsOfExperience,
+                result["monthlyP50"], result["monthlyP75"], result["monthlyP90"],
+                result["confidence"])
 
     return {"code": 0, "message": "成功", "data": result}
 
