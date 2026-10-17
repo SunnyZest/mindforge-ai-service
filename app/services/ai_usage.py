@@ -17,6 +17,7 @@
 import asyncio
 import contextvars
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 from app.clients.java_client import java_client
@@ -79,16 +80,30 @@ def current_trace_id() -> str:
 
 
 def usage_fields(usage: Any) -> tuple[int, int, int]:
-    """从 SDK 的 usage 对象里取 (prompt, completion, total)。
+    """从 usage 里取 (prompt, completion, total)。
+
+    ⚠️ usage 有两种形态，必须都认：
+       - OpenAI 兼容 SDK 返回的是**对象**（属性访问）；
+       - DashScope rerank 走原生 REST，返回的是**dict**（键访问）。
+       只用 getattr 的话 dict 永远取不到值 —— rerank 的 token 记账会一直是 0，
+       而且不报错，看着像「模型没消耗」，实际是统计瞎了。
 
     ⚠️ embedding 的响应只有 prompt_tokens / total_tokens，没有 completion_tokens；
-       而且不同提供方可能少字段，所以一律 getattr + 兜底。
+       而且不同提供方可能少字段，所以一律兜底 0。
     """
     if usage is None:
         return 0, 0, 0
-    prompt = getattr(usage, "prompt_tokens", 0) or 0
-    completion = getattr(usage, "completion_tokens", 0) or 0
-    total = getattr(usage, "total_tokens", 0) or (prompt + completion)
+
+    def pick(name: str) -> int:
+        raw = usage.get(name) if isinstance(usage, Mapping) else getattr(usage, name, None)
+        try:
+            return int(raw or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    prompt = pick("prompt_tokens")
+    completion = pick("completion_tokens")
+    total = pick("total_tokens") or (prompt + completion)
     return prompt, completion, total
 
 

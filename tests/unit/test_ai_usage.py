@@ -59,6 +59,26 @@ def test_usage_fields_handles_null_values():
                                                 total_tokens=None)) == (0, 0, 0)
 
 
+def test_usage_fields_reads_dict():
+    """★ rerank 走 DashScope 原生 REST，usage 是 dict 不是对象。
+
+    以前只用 getattr，dict 一律取到 0 —— rerank 的 token 记账永远是 0，
+    而且不报错，看着像「模型没消耗」，实际是统计瞎了。
+    """
+    assert ai_usage.usage_fields({"prompt_tokens": 30, "completion_tokens": 0,
+                                  "total_tokens": 30}) == (30, 0, 30)
+
+
+def test_usage_fields_reads_dict_with_only_total():
+    """DashScope rerank 只回 total_tokens，没有 prompt/completion。"""
+    assert ai_usage.usage_fields({"total_tokens": 42}) == (0, 0, 42)
+
+
+def test_usage_fields_tolerates_bad_dict_values():
+    """脏值（字符串 / 非法数字）不能把记账整条打挂。"""
+    assert ai_usage.usage_fields({"prompt_tokens": "abc", "total_tokens": None}) == (0, 0, 0)
+
+
 # ---------- payload 形状 ----------
 
 def test_payload_is_camel_case(monkeypatch):
