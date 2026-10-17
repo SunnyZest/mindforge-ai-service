@@ -9,6 +9,7 @@
 所以别在这里写任何「怎么获取任务」的逻辑。
 """
 
+import asyncio
 import logging
 
 from app.services import ai_usage
@@ -50,7 +51,10 @@ async def process_document(task: dict) -> bool:
         logger.info("  ① 下载完成：%d 字节", len(content))
 
         # ---------- ② 解析 ----------
-        result = parse(content, file_type)
+        # ⚠️ 必须放进线程池：解析是【同步】的，扫描件 PDF 会走 OCR
+        # （DashScope 每页 60s 超时、最多 30 页）、DOCX 也要读完整文档。
+        # 直接调用 = 阻塞事件循环，期间 /health、其他用户的对话全部卡死。
+        result = await asyncio.to_thread(parse, content, file_type)
         logger.info("  ② 解析完成：%d 字符", len(result.text))
 
         await java_client.update_status(

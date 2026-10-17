@@ -11,6 +11,7 @@ Java 在调过来之前已经完成了权限检查，并把确认过的 userId /
 这样 Java 侧不用为「调 Python」单独写一套解析。
 """
 
+import asyncio
 import json
 import logging
 
@@ -266,8 +267,10 @@ async def resume_parse(req: ResumeParseRequest) -> dict:
     ⚠️ 这是个【同步】接口，一次调用可能要几十秒（下载 + 提取 + 模型生成）。
     Java 侧的读超时是 120 秒，够用。
     """
+    # ⚠️ 同样是同步解析，必须让出线程池：扫描件 PDF 的 OCR 可能跑几分钟。
+    # 卡在事件循环里的话，这一个请求会把整个服务（含其他人的对话）拖死。
     content = await download_bytes(req.fileUrl)
-    extracted = parse(content, req.fileType)
+    extracted = await asyncio.to_thread(parse, content, req.fileType)
 
     parsed = await resume.parse_resume(
         extracted.text,
