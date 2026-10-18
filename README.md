@@ -113,6 +113,7 @@ mindforge-ai-service/
 │   │   ├── job.py               # 职位 JD 解析
 │   │   ├── match.py             # 简历-JD 匹配（五类结论）
 │   │   ├── interview.py         # 模拟面试出题 / 评分 / 复盘报告
+│   │   ├── salary.py           # AI 薪酬估算（区间/月数/置信度，服务端钳制不美化）
 │   │   └── tools/
 │   │       └── web_extractor.py # trafilatura 网页正文提取（防 SSRF）
 │   └── worker/
