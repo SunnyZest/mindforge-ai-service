@@ -283,12 +283,22 @@ def _parse_pdf_pypdf(content: bytes) -> ParseResult:
 
 # ---------- DOCX ----------
 
+# WordprocessingML 与 markup-compatibility 的命名空间。
+# 下面要直接读 XML —— python-docx 的 paragraphs/tables 看不到文本框里的内容。
+_W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_MC_NS = "{http://schemas.openxmlformats.org/markup-compatibility/2006}"
+
 
 def _parse_docx(content: bytes) -> ParseResult:
-    """DOCX —— 段落 + 表格。
+    """DOCX —— 段落 + 表格 + 文本框。
 
     ⚠️ python-docx 只能读 .docx（Office 2007+ 的 XML 格式），
     读不了老的 .doc（二进制格式）。那个类型应该在 Java 侧就被拦掉。
+
+    ⚠️ doc.paragraphs / doc.tables 只遍历 body 的直接子元素。中文简历模板
+    很爱用「文本框」排版 —— 整份简历装在几个 w:txbxContent 里，这种文件
+    doc.paragraphs 只能拿到一个空段落，最后就报「文件解析后没有文本内容」。
+    所以下面额外做一遍深度扫描，把文本框与内容控件里的段落也取出来。
     """
     import io
 
@@ -318,7 +328,59 @@ def _parse_docx(content: bytes) -> ParseResult:
             if any(cells):                            # 跳过整行空的
                 parts.append(" | ".join(cells))
 
+    # 文本框 / 内容控件：上面两个 API 看不到的地方，单独补一遍。
+    # 追加在末尾 —— 混排文档里文本框内容会排在正文之后，但不会丢。
+    parts.extend(_iter_extra_paragraph_texts(doc.element.body))
+
     return ParseResult(text="\n".join(parts), page_count=None)
+
+
+def _iter_extra_paragraph_texts(node, hidden: bool = False):
+    """产出 python-docx 取不到的段落文字：文本框(w:txbxContent) / 内容控件(w:sdt) 里的。
+
+    ⚠️ 必须跳过 mc:Fallback —— 那是 Word 给老版本留的降级副本，同一段文字在
+    mc:Choice 的 wps:txbx 与 mc:Fallback 的 v:textbox 里各存一份，
+    不跳的话整份正文会重复一遍。
+    """
+    for child in node:
+        tag = child.tag
+        if tag == _MC_NS + "Fallback":
+            continue
+        if tag == _W_NS + "p":
+            if hidden:
+                text = _paragraph_text(child)
+                if text:
+                    yield text
+            # 段落里可能挂着文本框，继续往下走
+            yield from _iter_extra_paragraph_texts(child, hidden)
+        elif tag == _W_NS + "tbl":
+            # 顶层表格由 doc.tables 负责（那边能拼出 `|`），这里只捞文本框里的
+            yield from _iter_extra_paragraph_texts(child, hidden)
+        else:
+            yield from _iter_extra_paragraph_texts(
+                child, hidden or tag in (_W_NS + "txbxContent", _W_NS + "sdt")
+            )
+
+
+def _paragraph_text(p) -> str:
+    """取段落自身的文字，不吞掉嵌套段落（文本框里那层）的文字。"""
+    buf: list[str] = []
+
+    def walk(n):
+        for c in n:
+            if c.tag == _W_NS + "p":
+                continue                              # 嵌套段落由外层递归单独处理
+            if c.tag == _W_NS + "t":
+                buf.append(c.text or "")
+            elif c.tag == _W_NS + "tab":
+                buf.append("\t")
+            elif c.tag in (_W_NS + "br", _W_NS + "cr"):
+                buf.append("\n")
+            else:
+                walk(c)
+
+    walk(p)
+    return "".join(buf).strip()
 
 
 def _decorate_heading(style_name: str, text: str) -> str:
