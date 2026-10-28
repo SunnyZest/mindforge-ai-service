@@ -1,12 +1,15 @@
 """文档解析：把文件字节变成纯文本。
 
-支持的类型：TXT / MD / PDF / DOCX / HTML。
+支持的类型：TXT / MD / PDF / DOCX / HTML / PNG / JPG。
 
 统一产出【带结构提示的纯文本】—— 标题保留 `#` 前缀，表格转成 `|` 分隔的行。
 这样后面分块时能识别结构边界，检索回来的片段也更容易读懂。
 
 不支持的类型（比如老的 .doc、扫描件 PDF）会明确报错，
 而不是静默产出一堆空字符串或者乱码 —— 报错好过脏数据。
+
+⚠️ 图片（PNG / JPG）是 2026-10-28 为「面试邀约截图」加的，走本地 RapidOCR。
+   它<不是>知识库文档类型：文档上传的类型白名单在 Java 侧，和这里无关。
 """
 
 import logging
@@ -15,7 +18,7 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 # 各类型的处理函数在文件末尾注册
-SUPPORTED_TYPES = ("TXT", "MD", "MARKDOWN", "PDF", "DOCX", "HTML", "HTM")
+SUPPORTED_TYPES = ("TXT", "MD", "MARKDOWN", "PDF", "DOCX", "HTML", "HTM", "PNG", "JPG", "JPEG")
 
 
 class UnsupportedFileTypeError(Exception):
@@ -159,6 +162,46 @@ def _ocr_page_rapidocr(image) -> str:
     if not result:
         return ""
     return "\n".join(item[1] for item in result if item and len(item) > 1 and item[1]).strip()
+
+
+# ---------- 图片（截图） ----------
+
+
+def _parse_image(content: bytes) -> ParseResult:
+    """PNG / JPG —— 本地 RapidOCR 离线识别。
+
+    ⚠️ 这里刻意**不**像 PDF 那样先试 DashScope 多模态，两个原因：
+      1. 截图里是聊天记录 / 邮件，要的是「按行排列的原文」。
+         RapidOCR 给的正是逐行文本；多模态大模型常会重排、补标点、改写，
+         一旦它改了字，下游的 evidence 子串校验（原文.contains(片段)）就会整片失败，
+         用户看到的是「字段全被丢了」而不是「识别不准」。
+      2. 本地引擎没有网络成本和延迟，一张截图 1~2 秒。
+    """
+    import io
+
+    from PIL import Image
+
+    try:
+        image = Image.open(io.BytesIO(content))
+        image.load()
+    except Exception as exc:  # noqa: BLE001
+        raise ParseError(f"图片无法读取（可能已损坏）：{exc}") from exc
+
+    # 带透明通道的 PNG 直接喂进去会得到 4 通道，OCR 会报错；统一转 RGB
+    if image.mode not in ("RGB", "L"):
+        image = image.convert("RGB")
+
+    try:
+        text = _ocr_page_rapidocr(image)
+    except ParseError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ParseError(f"图片 OCR 识别失败：{exc}") from exc
+
+    if not text.strip():
+        raise ParseError("图片里没有识别到文字 —— 可能截图太模糊，或者图里不是文字")
+
+    return ParseResult(text=text, page_count=1)
 
 
 def _parse_pdf_ocr(content: bytes) -> ParseResult:
@@ -480,4 +523,8 @@ _HANDLERS = {
     "DOCX": _parse_docx,
     "HTML": _parse_html,
     "HTM": _parse_html,
+    "PNG": _parse_image,
+    "JPG": _parse_image,
+    # 前端会把 JPEG 归一成 JPG 再传，这里兜一下别的客户端
+    "JPEG": _parse_image,
 }

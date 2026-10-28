@@ -20,7 +20,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.core.security import verify_service_token
-from app.services import ai_config, chat, interview, job, match, rag, resume, salary
+from app.services import ai_config, chat, interview, invitation, job, match, rag, resume, salary
 from app.services.downloader import download_bytes
 from app.services.embedding import EmbeddingCallError
 from app.services.llm import LlmCallError
@@ -617,6 +617,71 @@ async def tool_url_extract(req: UrlExtractRequest) -> dict:
     except Exception as exc:
         logger.exception("网页提取失败: %s", exc)
         return {"code": 50000, "message": f"网页提取失败: {exc}", "data": None}
+
+
+# ---------- 面试邀约抽取 ----------
+
+
+class InvitationExtractRequest(BaseModel):
+    """面试邀约抽取请求。
+
+    ⚠️ `text` 与 `contentBase64` **二选一**：
+       粘贴文本（微信邀面词 / 邮件正文）走 `text`，
+       文件（PDF / DOCX / PNG / JPG 截图）走 `fileType` + `contentBase64`。
+
+    ⚠️ 为什么文件要 base64 直传、不走「先上传再下载」：
+       邀约抽取是用户要**当场核对结果**才能确认的同步场景，
+       落 OSS 建文档反而多一份垃圾数据（用户点取消就留下一个没人认领的文档）。
+       单文件上限 10MB，由 Java 侧先挡一道。
+    """
+
+    userId: str = Field(default="", description="调用方已确认的用户 id（本服务只用于日志，不校验权限）")
+    text: str | None = Field(default=None, description="邀约原文，与文件二选一")
+    fileType: str | None = Field(
+        default=None, description="文件类型：PDF / DOCX / TXT / MD / PNG / JPG")
+    contentBase64: str | None = Field(
+        default=None, description="文件内容的纯 base64（不带 data: 前缀），与 text 二选一")
+
+
+def _decode_base64(value: str) -> bytes:
+    """解 base64。放在线程里跑 —— 10MB 的文件解码也要几十毫秒。"""
+    import base64
+
+    try:
+        return base64.b64decode(value, validate=True)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError("文件内容不是合法的 base64") from exc
+
+
+@router.post("/calendar/extract-invitation", summary="从面试邀约原文抽取日程候选")
+async def calendar_extract_invitation(req: InvitationExtractRequest) -> dict:
+    """把 HR 发来的邀约原文抽成「日程候选」。
+
+    **不落库、无副作用** —— 返回的是候选，用户在前端确认后由 Java 逐个写 job_event。
+
+    ⚠️ **必须回传 `sourceText`**：文件输入时 Java 手上没有原文（PDF / DOCX / 图片
+    只有本服务能解析），没有原文它就没法做 evidence 子串校验，
+    整个防幻觉链路会失效 —— 所以这份正文是契约的一部分，不是附带信息。
+
+    ⚠️ `eventAt` 必须是**北京时间、不带时区**的 `YYYY-MM-DDTHH:mm:ss`。
+    ICS 里的 `...Z` 是 UTC，直接塞会差 8 小时（提醒提前 8 小时发出去）。
+    """
+    if bool(req.text) == bool(req.contentBase64):
+        raise ValueError("text 与 contentBase64 必须二选一")
+
+    content = await asyncio.to_thread(_decode_base64, req.contentBase64) if req.contentBase64 else None
+
+    result = await invitation.extract_invitation(
+        text=req.text,
+        file_type=req.fileType,
+        content=content,
+    )
+
+    logger.info("邀约抽取：user=%s type=%s → 原文 %d 字符、%d 条候选",
+                req.userId, req.fileType or "TEXT",
+                len(result["sourceText"]), len(result["events"]))
+
+    return {"code": 0, "message": "成功", "data": result}
 
 
 # ---------- 服务能力状态 ----------
