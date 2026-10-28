@@ -114,6 +114,7 @@ mindforge-ai-service/
 │   │   ├── match.py             # 简历-JD 匹配（五类结论）
 │   │   ├── interview.py         # 模拟面试出题 / 评分 / 复盘报告
 │   │   ├── salary.py           # AI 薪酬估算（区间/月数/置信度，服务端钳制不美化）
+│   │   ├── invitation.py        # 面试邀约抽取（邀约原文/PDF/截图 → 日程候选，不落库）
 │   │   └── tools/
 │   │       └── web_extractor.py # trafilatura 网页正文提取（防 SSRF）
 │   └── worker/
@@ -268,6 +269,39 @@ Python 后台 Poller 驱动文档流转：
   data: {"type":"answer","hasAnswer":true,"answer":"完整聚合文本..."}
   ```
 
+### 5. 面试邀约抽取
+- **接口**：`POST /internal/ai/v1/calendar/extract-invitation`
+- **请求**（`text` 与 `contentBase64` **二选一**，两个都给或都不给返回 400）：
+  ```json
+  { "userId": "1001", "text": "HR 发来的原话…" }
+  { "userId": "1001", "fileType": "PDF", "contentBase64": "JVBERi0xLjQK…" }
+  ```
+  `fileType` 支持 `PDF` / `DOCX` / `TXT` / `MD` / `PNG` / `JPG`；`contentBase64` 不带 `data:` 前缀。
+- **响应**：
+  ```json
+  {
+    "code": 0, "message": "成功",
+    "data": {
+      "sourceText": "解析出来的正文…",
+      "events": [{
+        "title": "字节跳动 技术一面", "companyName": "字节跳动", "positionName": null,
+        "eventType": "INTERVIEW_1", "eventAt": "2026-10-30T14:00:00", "eventAtDerived": false,
+        "durationMinutes": 60, "eventMode": "ONSITE", "location": "上海张江",
+        "meetingUrl": null, "interviewer": "王琳", "note": null,
+        "evidence": { "eventType": "面技术一面", "eventAt": "10 月 30 日（周五）下午 2 点" },
+        "matchedJobId": null, "matchedJobTitle": null
+      }],
+      "sourceLength": 83, "warning": null, "truncated": false
+    }
+  }
+  ```
+  - ⚠️ **`sourceText` 是契约的一部分**：文件输入时 Java 手上没有原文，
+    没它就做不了 evidence 子串校验（防幻觉的最后一道闸），接口会直接返回 `50201`。
+  - ⚠️ **`eventAt` 是北京时间、不带时区**（`2026-10-30T14:00:00`）。
+    带 `Z` / `+09:00` 的输入会换算到 UTC+8 再输出 —— ICS 里的 `...Z` 是 UTC，
+    直接当本地时间用会让提醒提前 8 小时发出去。
+  - 不落库、无副作用：返回的是候选，用户在前端确认后才由 Java 写 `job_event`。
+
 ---
 
 ## 六、 自动化测试与质量保障
@@ -292,6 +326,14 @@ pytest tests/unit/test_web_extractor.py -v
    - Chroma 本地嵌入式模式（DuckDB/SQLite 后端）不支持多进程并发写入。生产环境若开启多 Uvicorn Worker，建议保持单 Poller 线程认领，检索支持只读并发。
 3. **网页提取防反爬超时**：
    - `web_extractor` 默认设置了 10 秒超时与标准浏览器 User-Agent 头；遇到极少数强反爬站点（如 Cloudflare 验证盾）时，会自动抛出规整的 400 提示错误，不会导致主进程挂起。
+4. **抽取类接口必须关掉模型的「思考」（`enable_thinking=False`）**：
+   - qwen3 系列默认开思考，思考 token 计入 `completion_tokens`，但**不出现在返回内容里**。
+     实测同一份 2746 字简历：思考开 8634 token / 164 秒，关掉 2301 token / 41 秒，字段一个没少。
+   - 邀约抽取更严重：开着思考时「一封含两轮面试的邮件」跑满 60 秒超时**直接失败**，关掉后 6.5 秒。
+   - 所以 `resume.parse_resume` / `invitation.extract_invitation` 都显式传了
+     `enable_thinking=settings.extract_enable_thinking`（默认 `False`）。
+     换到不支持该参数的模型时，把它设成 `true` 即可回退，不用改代码。
+   - ⚠️ 给新接口配超时预算时要按**关思考后**的量算 —— 按开着思考的量算会高估 3~4 倍。
 
 ---
 
