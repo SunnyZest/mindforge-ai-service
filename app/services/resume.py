@@ -82,6 +82,10 @@ async def parse_resume(text: str, *, target_position: str | None = None) -> dict
         # ⚠️ 同理，超时也不能用对话的 120 秒 —— 实测详细简历要跑满 120 秒。
         timeout=settings.extract_timeout_seconds,
         scene=ai_usage.SCENE_RESUME_PARSE,
+        # ★ 关掉「思考」—— 这是本接口从 164 秒降到 41 秒的唯一原因（见 config.py）。
+        #   抽的是「简历里写了什么」，不需要先推理一遍；
+        #   开着思考时 8600 个输出 token 里有 6300 个是思考过程，用户等的就是它。
+        enable_thinking=settings.extract_enable_thinking,
     )
 
     structured = _normalize(extract_json_object(raw))
@@ -153,9 +157,12 @@ def _normalize_work(value: Any) -> list[dict[str, Any]]:
             "position": clean_str(item.get("position"), max_len=128),
             "startDate": clean_str(item.get("startDate"), max_len=32),
             "endDate": clean_str(item.get("endDate"), max_len=32),
-            # 提示词里要求「长原文只留关键句、不要整段照抄」，这里 1500 是安全网。
-            # 之前是 4000 —— 模型会把简历原文大段搬回来，输出量翻好几倍。
-            "description": clean_str(item.get("description"), max_len=1500),
+            # 提示词里要求「每条不超过 200 字」，这里 600 是安全网（3 倍余量）。
+            # ⚠️ 安全网刻意比提示词宽 —— 它是硬切、不加省略号，
+            #    卡到 200 会把正常输出从句子中间砍断，界面上很难看。
+            #    真正决定输出量的是提示词，不是这个数（它对耗时没有影响：
+            #    token 在模型生成时就已经花掉了，这里只是少存一点）。
+            "description": clean_str(item.get("description"), max_len=600),
         })
     return result
 
@@ -169,8 +176,8 @@ def _normalize_projects(value: Any) -> list[dict[str, Any]]:
         result.append({
             "name": name,
             "role": clean_str(item.get("role"), max_len=128),
-            # 同 workExperience.description：1500 是安全网，主要靠提示词约束
-            "description": clean_str(item.get("description"), max_len=1500),
+            # 同 workExperience.description：600 是安全网，主要靠提示词约束
+            "description": clean_str(item.get("description"), max_len=600),
             "techStack": clean_str_list(item.get("techStack"), item_max_len=64, limit=30),
         })
     return result

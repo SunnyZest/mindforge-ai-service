@@ -107,6 +107,7 @@ class LlmService:
         timeout: float | None = None,
         scene: str = ai_usage.SCENE_UNKNOWN,
         user_id: str | int | None = None,
+        enable_thinking: bool | None = None,
     ) -> str:
         """一次对话，返回完整回答。
 
@@ -121,6 +122,13 @@ class LlmService:
                 报出来的错误根本没机会传回去，对方只会看到「连接断了」。
             scene: 业务场景（{@code ai_usage.SCENE_*}），只用于 AI 使用量统计。
             user_id: 触发用户，只用于 AI 使用量统计。
+            enable_thinking: 是否让模型先「思考」再输出。
+                None（默认）= 不干预，跟随模型自身的默认行为。
+                ⚠️ **抽取类场景要显式传 False**，理由见 config.py 的
+                extract_enable_thinking —— 实测 qwen3 系列默认开思考，
+                简历解析 8600 个 completion token 里有 6300 个是思考过程，
+                耗时 164 秒；关掉后同样一份简历 2301 token、41 秒，
+                抽出来的字段一个没少。
 
         Raises:
             LlmCallError: 调用失败
@@ -141,6 +149,7 @@ class LlmService:
                 temperature=final_temperature,
                 max_tokens=final_max_tokens,
                 timeout=timeout,
+                extra_body=_thinking_body(enable_thinking),
             )
         except Exception as exc:                     # noqa: BLE001
             _report(scene, user_id, config, started, status=ai_usage.FAILED,
@@ -277,6 +286,21 @@ class LlmService:
         # client 是懒建的，可能压根没建过
         if self._openai is not None:
             await self._openai.close()
+
+
+def _thinking_body(enable_thinking: bool | None) -> dict | None:
+    """把 enable_thinking 包成 OpenAI SDK 的 extra_body。
+
+    ⚠️ 为什么走 extra_body 而不是给 create() 加参数：
+       这是 DashScope（OpenAI 兼容模式）的扩展字段，不在 OpenAI 的
+       chat.completions 契约里，SDK 没有对应的形参。
+    ⚠️ 为什么 None 要返回 None 而不是空 dict：
+       不干预就必须真的不传 —— 传了 enable_thinking=None 有些网关会当成
+       字符串 "None" 或直接 400，而默认值应当由模型自己决定。
+    """
+    if enable_thinking is None:
+        return None
+    return {"enable_thinking": enable_thinking}
 
 
 def _report(scene: str, user_id: str | int | None, config: "ai_config.ModelConfig",
