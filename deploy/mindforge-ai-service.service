@@ -1,0 +1,39 @@
+# MindForge AI Python 服务（FastAPI）systemd 服务单元
+#
+# 安装（服务器上执行）：
+#   sudo cp mindforge-ai-service.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mindforge-ai-service
+#
+# 查看日志：
+#   journalctl -u mindforge-ai-service -f
+
+[Unit]
+Description=MindForge AI Python service (FastAPI + RAG pipeline)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mindforge
+Group=mindforge
+# 必须是项目根目录：pydantic-settings 从这里读 .env，
+# chroma 的持久化目录（data/）也相对这里
+WorkingDirectory=/opt/mindforge/ai-service
+
+# 运行时直接用 uv sync 装好的 .venv，不再经过 uv
+#（uv run 每次还要解析锁文件，systemd 里没必要）
+# ⚠️ 单 worker：chroma 是本地文件库，多 worker 会并发写坏数据；
+#    2核2G 也扛不住多进程。吞吐不够时先扩内存再谈 worker。
+ExecStart=/opt/mindforge/ai-service/.venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 --port 8000 --workers 1
+
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=5
+
+# FastAPI + chroma + httpx 的 RSS 峰值约 400~600MB，给到 800M 封顶
+MemoryMax=800M
+
+[Install]
+WantedBy=multi-user.target
