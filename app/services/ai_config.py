@@ -22,6 +22,7 @@
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from app.clients.java_client import java_client
 from app.config import settings
@@ -32,9 +33,18 @@ SCENE_CHAT = "CHAT"
 SCENE_EMBEDDING = "EMBEDDING"
 SCENE_RERANK = "RERANK"
 
+# 所有已定义的用途。snapshot() 必须把【每一个】都吐出来 ——
+# 管理端要能看见「这个用途在用默认值」，只列配过的那几个等于把信息藏起来。
+ALL_SCENES: tuple[str, ...] = (SCENE_CHAT, SCENE_EMBEDDING, SCENE_RERANK)
+
 # 拉取间隔。配置变更最多延迟这么久生效 —— 改模型配置不是高频操作，
 # 60 秒换来「调用方零改动」很划算。轮询循环同理，也用的这个量级。
 REFRESH_SECONDS = 60
+
+# 固定 +08:00，不用 ZoneInfo("Asia/Shanghai") ——
+# Windows 没有系统时区库，用 ZoneInfo 要额外装 tzdata，漏装就是启动期崩。
+# 本项目只面向国内，固定偏移与 Asia/Shanghai 完全等价。
+_CST = timezone(timedelta(hours=8))
 
 
 @dataclass(frozen=True)
@@ -59,6 +69,11 @@ class ModelConfig:
 # （CPython 里 dict 的引用替换是原子的，读到旧的或新的都自洽）。
 _cache: dict[str, ModelConfig] = {}
 _last_error: str | None = None
+
+# 上一次【成功】拉取的时间（北京时间）。
+# ⚠️ 失败时保留上一次的值，不清空 —— 清空会让「配置多久没刷新了」这个信息丢失，
+#    而排查「改了配置怎么没生效」时，第一眼要看的正是它。
+_refreshed_at: datetime | None = None
 
 
 def _env_config(scene: str) -> ModelConfig:
@@ -120,6 +135,64 @@ def last_error() -> str | None:
     return _last_error
 
 
+def refreshed_at() -> datetime | None:
+    """上一次【成功】拉取的时间；从没成功过就是 None。"""
+    return _refreshed_at
+
+
+@dataclass(frozen=True)
+class SceneSnapshot:
+    """一个用途当前真正在用的配置 —— 给管理端看的，不是给调用方用的。
+
+    ⚠️ 只有 has_key 布尔，<b>绝不含 api_key 本身</b>。
+       管理端要回答的问题是「这个用途到底通没通」，不是「Key 是什么」。
+    """
+
+    scene: str
+    model: str
+    source: str
+    base_url: str
+    has_key: bool
+
+
+def snapshot() -> dict:
+    """当前生效的配置快照，给管理端展示。
+
+    ★ <b>为什么这个逻辑必须在 Python 侧</b>：
+      生效规则是 `get(scene)` 的 `_cache.get(scene) or _env_config(scene)`，
+      也就是「Java 下发的优先，没有就回退 .env」。这条规则只有本服务知道
+      （.env 的模型名也只有本服务看得见）。Java 侧重算一遍必然漂移，
+      而这种漂移最难查 —— 两边都说自己对。
+
+    ★ 覆盖 {@link ALL_SCENES} 里的<b>每一个</b>用途，没配的也要出现
+      （source="env"）：管理端需要知道「这个用途在用默认值」，
+      只列配过的那些，等于把「没配」这件事藏起来了。
+
+    ⚠️ 返回的 model 可能是空串（RERANK 没有环境变量兜底），
+       这表示「未配置」，不是「配置成了空名字」。
+    """
+    scenes: list[dict] = []
+    for scene in ALL_SCENES:
+        cfg = get(scene)
+        scenes.append({
+            "scene": scene,
+            "model": cfg.model,
+            "source": cfg.source,
+            # 对外是 camelCase，和 Java / 前端的命名对齐
+            "baseUrl": cfg.base_url,
+            # ⚠️ 只回布尔。api_key 一个字符都不能出现在响应里。
+            "hasKey": bool(cfg.api_key.strip()),
+        })
+
+    return {
+        "scenes": scenes,
+        # ISO 带时区（+08:00），前端直接显示。从没成功拉过就是 None，
+        # 前端据此显示「尚未同步」而不是一个假的时间。
+        "refreshedAt": _refreshed_at.isoformat() if _refreshed_at else None,
+        "lastError": _last_error,
+    }
+
+
 def _from_java(raw: dict) -> ModelConfig | None:
     """把 Java 下发的一条转成 ModelConfig；不完整就返回 None（跳过）。"""
     scene = (raw.get("scene") or "").strip().upper()
@@ -151,7 +224,7 @@ async def refresh_once() -> int:
        否则 Java 抖一下，所有 scene 就一起掉回环境变量，
        线上表现为「模型突然换了」，比「配置晚 60 秒生效」严重得多。
     """
-    global _cache, _last_error
+    global _cache, _last_error, _refreshed_at
 
     try:
         models = await java_client.list_ai_models()
@@ -171,6 +244,10 @@ async def refresh_once() -> int:
         fresh[config.scene] = config
 
     _last_error = None
+    # ★ 只在【成功】时更新。失败时保留上一次的时间，
+    #   否则「配置已经 3 小时没刷新成功」这个关键信息就被抹掉了。
+    #   抹掉微秒：这是个给人看的「上次同步时间」，微秒只是噪音。
+    _refreshed_at = datetime.now(_CST).replace(microsecond=0)
     changed = fresh != _cache
     _cache = fresh
 

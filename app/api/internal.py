@@ -684,6 +684,28 @@ async def calendar_extract_invitation(req: InvitationExtractRequest) -> dict:
     return {"code": 0, "message": "成功", "data": result}
 
 
+# ---------- AI 配置快照 ----------
+
+
+@router.get("/config/effective", summary="当前生效的 AI 配置（供管理端展示）")
+async def config_effective() -> dict:
+    """把内存缓存里**真正在用的**模型配置吐出来。
+
+    解决的是两个「管理端看不出来」的坑：
+      ① 某个用途有多条配置但都没有勾默认时，实际生效的是 id 最大的那条；
+      ② 某个用途一条都没配时，实际走 .env —— 而 .env 的模型名只有本服务知道。
+    两种情况下管理端列表都看不出「到底在用什么」，排查只能去翻
+    ai_usage_record.model_name。
+
+    ⚠️ **只读**，不改任何状态。
+    ⚠️ **绝不含 api_key**，只回 has_key 布尔 —— 管理端要回答的是「通没通」，
+       不是「Key 是什么」。真要改 Key 走管理端的写接口。
+    ⚠️ 这个快照来自内存缓存，最多滞后 REFRESH_SECONDS（60 秒）。
+       响应里的 refreshedAt 就是上一次成功拉取的时间，排查「改了没生效」先看它。
+    """
+    return {"code": 0, "message": "成功", "data": ai_config.snapshot()}
+
+
 # ---------- 服务能力状态 ----------
 
 
