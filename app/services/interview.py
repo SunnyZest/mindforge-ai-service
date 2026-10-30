@@ -331,10 +331,13 @@ async def build_report(
     Returns:
         {   # ⚠️ 键用 camelCase，直接对齐 interview_report 表的列
           "overallScore", "technicalScore", "communicationScore",
-          "problemSolvingScore",
+          "problemSolvingScore", "engineeringScore", "jobFitScore",
           "strengths": [...], "weaknesses": [...], "suggestions": [...],
           "reportText": str | None,
         }
+
+        ⚠️ `overallScore` 是【服务端按权重算的】，不是模型给的；
+           `engineeringScore` / `jobFitScore` 可能为 None（岗位未指定时后者必为 None）。
 
     Raises:
         ValueError: 一道题都没有
@@ -360,12 +363,60 @@ async def build_report(
 
     result = _normalize_report(extract_json_object(raw))
 
-    logger.info("面试报告生成完成：综合 %s（技术 %s / 沟通 %s / 问题解决 %s）",
-                result["overallScore"],
-                result["technicalScore"], result["communicationScore"],
-                result["problemSolvingScore"])
+    logger.info(
+        "面试报告生成完成：综合 %s（技术 %s / 沟通 %s / 问题解决 %s / 工程 %s / 岗位 %s）",
+        result["overallScore"],
+        result["technicalScore"], result["communicationScore"],
+        result["problemSolvingScore"],
+        result["engineeringScore"], result["jobFitScore"])
 
     return result
+
+
+# 报告五维加权系数。
+# ⚠️ 权重只在这里定义，不要写进 prompt 让模型自己算 ——
+#    带小数的加权求和模型经常算错，而且算错了看不出来：
+#    你分不清是它把权重搞错了，还是它对候选人另有判断。
+#
+# 取值依据：公开面试评分表的常见区间（专业能力 30~40%、沟通 15~30%、
+# 问题解决 15~20%、岗位匹配 5~15%），不是测算出来的 —— 模拟面试没有
+# 真实结果做对照，权重在数学上无法校准，只能设、不能算。
+# 用整数而不是小数，一是让人一眼看出这是设定值，二是用户能心算验一遍
+# （40+20+20+10+10=100），三是整数乘加再除 100 没有浮点误差。
+_REPORT_WEIGHTS: dict[str, int] = {
+    "technicalScore": 40,
+    "problemSolvingScore": 20,
+    "communicationScore": 20,
+    "engineeringScore": 10,
+    "jobFitScore": 10,
+}
+
+# 模型自报总分与计算值的最大允许偏差，超过就认为模型跑偏
+_OVERALL_TOLERANCE = 5.0
+
+
+def _calc_overall(scores: dict[str, float | None]) -> float | None:
+    """按 _REPORT_WEIGHTS 算综合分。
+
+    ⚠️ 只对【有值】的维度加权，再把权重归一化到 1。
+       缺 jobFitScore 时（没指定目标岗位）权重和只剩 90，
+       不归一化会算出 70 分上下 —— 而被评估的四项其实都在 80 分以上。
+       实测：技术 85 / 问题解决 80 / 沟通 76 / 工程 88，归一化 82.2，
+       不归一化 74.0，差 8.2 分；而且这是系统性的，
+       每一场没指定岗位的面试都会低这么多。
+
+    ⚠️ 全部维度都为空时返回 None，不要返回 0 ——
+       0 分和「没有评分」是两件事，前者会显示成一个极差的成绩。
+    """
+    pairs = [
+        (_REPORT_WEIGHTS[key], value)
+        for key, value in scores.items()
+        if value is not None and key in _REPORT_WEIGHTS
+    ]
+    total_weight = sum(weight for weight, _ in pairs)
+    if total_weight <= 0:
+        return None
+    return round(sum(weight * value for weight, value in pairs) / total_weight, 1)
 
 
 def _normalize_report(raw: dict[str, Any]) -> dict[str, Any]:
@@ -373,13 +424,35 @@ def _normalize_report(raw: dict[str, Any]) -> dict[str, Any]:
 
     ⚠️ 输出的键用 camelCase —— 见 _normalize_questions 的说明。
     这几个字段名直接对齐 `interview_report` 表的列（Java 那边要往表里写）。
+
+    ⚠️ `overallScore` 在这里按权重算，不用模型给的 —— 见 _calc_overall。
+       模型自报的那个只用来发现「它跑偏了」，会打 WARNING，但不作为最终值。
     """
-    return {
-        "overallScore": clean_float(raw.get("overallScore"), lo=0, hi=100),
+    scores: dict[str, float | None] = {
         "technicalScore": clean_float(raw.get("technicalScore"), lo=0, hi=100),
         "communicationScore": clean_float(raw.get("communicationScore"), lo=0, hi=100),
         "problemSolvingScore": clean_float(
             raw.get("problemSolvingScore"), lo=0, hi=100),
+        # 工程规范与岗位契合都是可空的：模型判断不了就不给
+        "engineeringScore": clean_float(raw.get("engineeringScore"), lo=0, hi=100),
+        "jobFitScore": clean_float(raw.get("jobFitScore"), lo=0, hi=100),
+    }
+
+    computed = _calc_overall(scores)
+
+    # 模型自报的总分只用来发现「模型跑偏」，不作为最终值。
+    # 理由：同一个「综合分」不能有时是加权、有时是模型直觉 ——
+    #       那样用户没法拿它横向比较不同场次的面试。
+    model_said = clean_float(raw.get("overallScore"), lo=0, hi=100)
+    if model_said is not None and computed is not None:
+        if abs(model_said - computed) > _OVERALL_TOLERANCE:
+            logger.warning(
+                "模型自报综合分 %.1f 与加权计算值 %.1f 相差超过 %.0f 分，采用计算值",
+                model_said, computed, _OVERALL_TOLERANCE)
+
+    return {
+        **scores,
+        "overallScore": computed,
         "strengths": clean_str_list(raw.get("strengths"), item_max_len=500, limit=10),
         "weaknesses": clean_str_list(raw.get("weaknesses"), item_max_len=500, limit=10),
         "suggestions": clean_str_list(raw.get("suggestions"), item_max_len=500, limit=10),

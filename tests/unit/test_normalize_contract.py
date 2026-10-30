@@ -267,7 +267,10 @@ class TestInterviewNormalize:
             "overallScore": 150, "technicalScore": -5,
             "communicationScore": 80, "problemSolvingScore": 60,
         })
-        assert result["overallScore"] is None
+        # 越界的分项各自被丢弃 —— 脏数据不该拖累其它维度
         assert result["technicalScore"] is None
         assert result["communicationScore"] == 80.0
         assert result["problemSolvingScore"] == 60.0
+        # ★ 综合分改为服务端按权重算（2026-10-30），不再取模型报的 150：
+        #   只剩沟通(20) 与 问题解决(20) 两维，归一化后 (20*80 + 20*60) / 40 = 70.0
+        assert result["overallScore"] == 70.0
