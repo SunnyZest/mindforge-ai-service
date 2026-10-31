@@ -116,11 +116,15 @@ class EmbeddingService:
             # 一次处理的条数(长度)
             batch = cleaned[start:start + batch_size]
             started = time.monotonic()
+            # 维度按配置指定；0 表示不传，用模型默认值。
+            # 不支持的模型会静默忽略这个参数，实际维度对不上时由
+            # VectorStore._check_embedding_compat 拦住。
+            kwargs: dict = {"model": config.model, "input": batch}
+            if settings.embedding_dim and settings.embedding_dim > 0:
+                kwargs["dimensions"] = settings.embedding_dim
+
             try:
-                resp = await self._client().embeddings.create(
-                    model=config.model,
-                    input=batch,
-                )
+                resp = await self._client().embeddings.create(**kwargs)
             except Exception as exc:                    # noqa: BLE001
                 _report(scene, user_id, config, started, status=ai_usage.FAILED,
                         error=f"{type(exc).__name__}: {exc}")

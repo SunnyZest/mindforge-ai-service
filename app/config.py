@@ -40,7 +40,18 @@ class Settings(BaseSettings):
     dashscope_api_key: str = ""
     dashscope_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     chat_model: str = "deepseek-v4-flash"
-    embedding_model: str = "text-embedding-v1"
+    embedding_model: str = "qwen3.7-text-embedding"
+    # 向量维度。0 表示不指定、用模型默认值。
+    #
+    # ⚠️ 换 embedding 模型 = 必须重建向量，哪怕维度没变 —— 语义空间是模型训练出来的，
+    #    两个模型都输出 1536 维，同一个词的坐标也完全不同，混在一起算 cosine 会静默变差。
+    #    改这个值之前先看 vector_store.py 类注释里的流程。
+    #
+    # ⚠️ 并非所有模型都支持 dimensions 参数：text-embedding-v1/v2 固定 1536、
+    #    qwen3.7-text-embedding-flash 固定 1024（传了会被静默忽略）。
+    #    传了不支持的维度不会报错，但实际返回的维度对不上时，
+    #    vector_store 的校验会拦住 —— 这是最后一道闸。
+    embedding_dim: int = 1536
 
     # ---------- 轮询 ----------
     # 没有任务时的休眠秒数。别设太小 —— 会把 Java 的日志刷爆。
@@ -65,8 +76,13 @@ class Settings(BaseSettings):
     chroma_collection: str = "mindforge_chunks"
 
     # ---------- 嵌入 ----------
-    # DashScope 的 embedding 接口单次最多 25 条，超了会报错，所以要分批
-    embedding_batch_size: int = 25
+    # 单批嵌入的条数上限。各模型不一样，取最小值 10 才能换模型不炸：
+    #   text-embedding-v1/v2   25 条
+    #   text-embedding-v3/v4   10 条
+    #   qwen3.7-text-embedding 20 条
+    # ⚠️ 配大了会在真调 API 时 400（"batch size is invalid, it should not be
+    #    larger than 20"）—— 这个错只在有文档要向量化时才出现，纯启动测不出来。
+    embedding_batch_size: int = 10
     # 单文档最多切多少块 —— 防御性上限。
     # 超大文件可能切出几万块，把 embedding API 打爆（也烧钱）。
     max_chunks_per_document: int = 2000
