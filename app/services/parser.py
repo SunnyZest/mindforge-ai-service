@@ -119,6 +119,7 @@ def _ocr_page_dashscope(image_bytes: bytes) -> str:
             return ""
 
         import base64
+
         from openai import OpenAI
 
         base64_img = base64.b64encode(image_bytes).decode("utf-8")
@@ -211,6 +212,7 @@ def _parse_pdf_ocr(content: bytes) -> ParseResult:
     若无 API Key 或网络调用失败，无缝回退至本地 RapidOCR 离线引擎。
     """
     import io
+
     import pypdfium2 as pdfium
 
     try:

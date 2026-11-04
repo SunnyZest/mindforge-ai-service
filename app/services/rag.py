@@ -11,8 +11,9 @@
 
 import logging
 
-from app.services import ai_usage, rerank as rerank_service
 from app.config import settings
+from app.services import ai_usage
+from app.services import rerank as rerank_service
 from app.services.embedding import embedding_service
 from app.services.rerank import RerankCallError
 from app.services.vector_store import vector_store

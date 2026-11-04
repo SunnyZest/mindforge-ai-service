@@ -19,7 +19,6 @@ import pytest
 
 from app.services import interview
 
-
 # ---------- 综合分：五种输入 ----------
 
 

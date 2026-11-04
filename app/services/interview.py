@@ -17,7 +17,7 @@ import logging
 from typing import Any
 
 from app.config import settings
-from app.services import prompt, rag, ai_usage
+from app.services import ai_usage, prompt, rag
 from app.services.json_utils import (
     clean_dict_list,
     clean_enum,
@@ -444,11 +444,10 @@ def _normalize_report(raw: dict[str, Any]) -> dict[str, Any]:
     # 理由：同一个「综合分」不能有时是加权、有时是模型直觉 ——
     #       那样用户没法拿它横向比较不同场次的面试。
     model_said = clean_float(raw.get("overallScore"), lo=0, hi=100)
-    if model_said is not None and computed is not None:
-        if abs(model_said - computed) > _OVERALL_TOLERANCE:
-            logger.warning(
-                "模型自报综合分 %.1f 与加权计算值 %.1f 相差超过 %.0f 分，采用计算值",
-                model_said, computed, _OVERALL_TOLERANCE)
+    if model_said is not None and computed is not None and abs(model_said - computed) > _OVERALL_TOLERANCE:
+        logger.warning(
+            "模型自报综合分 %.1f 与加权计算值 %.1f 相差超过 %.0f 分，采用计算值",
+            model_said, computed, _OVERALL_TOLERANCE)
 
     return {
         **scores,

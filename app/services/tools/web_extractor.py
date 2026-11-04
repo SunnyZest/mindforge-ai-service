@@ -5,6 +5,7 @@ import ipaddress
 import logging
 import socket
 from urllib.parse import urljoin, urlparse
+
 import httpx
 import trafilatura
 

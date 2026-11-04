@@ -10,7 +10,7 @@ import logging
 from typing import Any
 
 from app.config import settings
-from app.services import prompt, ai_usage
+from app.services import ai_usage, prompt
 from app.services.json_utils import (
     clean_dict_list,
     clean_enum,

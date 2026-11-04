@@ -12,9 +12,9 @@
 import asyncio
 import logging
 
-from app.services import ai_usage
 from app.clients.java_client import java_client
 from app.config import settings
+from app.services import ai_usage
 from app.services.downloader import download_bytes
 from app.services.embedding import embedding_service
 from app.services.parser import ParseError, UnsupportedFileTypeError, parse

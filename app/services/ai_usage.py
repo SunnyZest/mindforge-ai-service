@@ -173,5 +173,5 @@ async def drain(timeout: float = 3.0) -> None:
     pending = list(_pending)
     try:
         await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=timeout)
-    except (TimeoutError, asyncio.TimeoutError):
+    except TimeoutError:
         logger.warning("还有 %d 条 AI 使用量没上报完，直接关闭", len(_pending))

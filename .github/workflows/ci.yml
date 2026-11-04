@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Ruff + Mypy + Pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: 安装 Python 3.12
+        run: uv python install 3.12
+
+      - name: 同步依赖
+        run: uv sync --frozen
+
+      - name: Ruff
+        run: uv run ruff check app tests
+
+      # P0 阶段 mypy 只报告、不阻断：还有 41 条历史类型问题没清。
+      # 清零后删掉 continue-on-error，让它成为真正的门禁。
+      - name: Mypy（advisory）
+        continue-on-error: true
+        run: uv run mypy app
+
+      - name: Pytest（默认跳过 e2e）
+        run: uv run pytest -q

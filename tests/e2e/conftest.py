@@ -12,7 +12,6 @@
 """
 
 import os
-from typing import Any
 
 import httpx
 import pytest

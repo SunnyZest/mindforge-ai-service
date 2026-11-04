@@ -34,6 +34,8 @@ default = true
 dev = [
     "pytest==8.3.5",
     "reportlab>=5.0.1",
+    "ruff==0.17.3",
+    "mypy==2.4.1",
 ]
 
 # 说明
@@ -53,3 +55,31 @@ markers = [
 # 默认跳过 e2e：日常改代码只要几秒钟的反馈，不想每次都等十几分钟、还花钱。
 # 要跑真实链路时显式指定：pytest -m e2e
 addopts = "-m 'not e2e'"
+
+[tool.ruff]
+# 中文注释多，行长不是主要矛盾；E501 也不在下面的 select 里。
+line-length = 120
+target-version = "py312"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+# 刻意从保守规则集起步：只开「一定是问题」的规则，避免第一天就产生大片历史告警。
+# 后续新增规则时，先跑 `ruff check --statistics` 评估量级，再决定是否纳入阻断。
+select = [
+    "E4",  # import 相关（E401/E402）
+    "E7",  # 语法层面的明显错误
+    "E9",  # 运行时错误（如未定义变量）
+    "F",   # pyflakes：未使用导入/变量、未定义名称
+    "I",   # import 排序
+    "UP",  # pyupgrade：过时写法
+    "SIM", # 可简化写法
+    "B",   # bugbear：常见陷阱
+]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_configs = true
+# P0 阶段只报告、不阻断：当前有 41 条历史类型问题（主要在 services/interview.py、chat.py），
+# 清零后再把 CI 里的 continue-on-error 去掉。
+

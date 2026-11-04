@@ -10,8 +10,8 @@ import logging
 from collections.abc import AsyncIterator
 
 from app.config import settings
-from app.services import prompt, rag, ai_usage
-from app.services.llm import LlmCallError, llm_service
+from app.services import ai_usage, prompt, rag
+from app.services.llm import llm_service
 
 logger = logging.getLogger(__name__)
 

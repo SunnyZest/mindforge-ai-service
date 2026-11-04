@@ -1,11 +1,12 @@
 """测试 PDF 文档解析与扫描件 OCR 降级功能。"""
 
 import io
+
 from PIL import Image, ImageDraw
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
-from app.services.parser import parse, ParseResult
+from app.services.parser import ParseResult, parse
 
 
 def _create_image_pdf(text: str) -> bytes:

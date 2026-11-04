@@ -1,6 +1,7 @@
 """RAG 对话无私域资料时优雅降级单元测试。"""
 
 from unittest.mock import AsyncMock, patch
+
 import pytest
 
 from app.services import chat

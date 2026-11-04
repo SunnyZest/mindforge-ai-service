@@ -1,6 +1,7 @@
 """公域官方智库 + 私域个人库双路联合检索（Dual-Track RAG）与模拟面试/简历赋能单元测试。"""
 
 import json
+
 import pytest
 
 from app.services import interview, resume

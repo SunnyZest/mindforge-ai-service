@@ -10,7 +10,6 @@
 
 import logging
 import re
-from pathlib import Path
 
 from app.config import PROJECT_ROOT
 from app.services import prompt_store
